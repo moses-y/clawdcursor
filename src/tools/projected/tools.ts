@@ -17,8 +17,10 @@ import { imageScale, scaleCoord, screenCenter, mapImagePoint, mapImageLength } f
 import type { InvokeAction, UiElement } from '../../platform/types';
 import { ocrEngine } from '../../platform/ocr-engine';
 import { selectOption, selectedResult } from '../../platform/select-option';
-import { SCREEN_COORDS_NOTE, shownValue, shownHelp, opaqueArea, opaqueAreaLine, SPARSE_NEXT_STEP, isSparseTree, CUT_VALUE_NEXT_STEP, cdpStepFor } from '../blind-hints';
+import { ownsPoint } from '../click-owner';
+import { SCREEN_COORDS_NOTE, shownValue, shownHelp, opaqueArea, opaqueAreaLine, drawnControlsLine, SPARSE_NEXT_STEP, isSparseTree, CUT_VALUE_NEXT_STEP, cdpStepFor, cdpBrowserPid } from '../blind-hints';
 import { getUiTreeWithWake } from '../../platform/a11y-wake';
+import { wakeForNameSearch, onTopOfLine } from '../name-search-help';
 import { isBrowserProcess } from '../../platform/browser-config';
 import { agentBrowserConnectOptions, DEFAULT_CDP_PORT } from '../../platform/browser-config';
 import { parseAssertions, checkAssertions, renderReport, EXPECT_SCHEMA } from '../../core/verify/assertions';
@@ -27,14 +29,17 @@ import { renderUIMap } from '../../core/sense/ui-map-render';
 import { wrapUntrustedScreenContent, screenJson, quoteScreenText } from '../../core/untrusted-screen-content';
 import { resolveRef } from '../../core/sense/ui-map-resolve';
 import { ensureVisible } from '../../core/sense/ui-map-visible';
-import { findActionButton, findInputField } from '../../core/sense/ui-map-find';
-import { waitForPaste, writeClipboardVerified, readBackTyped, setResult, setVerdict, fieldRead, typesAsKeys, EMPTY_AFTER_TYPING, selectAllScope, type Retyped } from '../paste-guard';
+import { findActionButton, findInputField, type FindResult } from '../../core/sense/ui-map-find';
+import { inferCapabilities } from '../../core/sense/ui-map-normalize';
+import type { UIMap, UIElement } from '../../core/sense/ui-map-types';
+import { pasteChoice, CLIPBOARD_HELD_REFUSAL, waitForPaste, writeClipboardVerified, readBackTyped, setResult, setVerdict, fieldRead, typesAsKeys, EMPTY_AFTER_TYPING, selectAllScope, type Retyped } from '../paste-guard';
 import { sleepUnlessStopped, STOPPED_TEXT } from '../../core/control';
 import { timeWait } from '../../core/observability/steps';
 import { unguarded } from '../../platform/pointer-guard';
-import { preferControl, notSelectableReason, failReason, sameElement, inside, ensureInFront } from '../../platform/prefer-control';
+import { preferControl, notSelectableReason, failReason, sameElement, inside } from '../../platform/prefer-control';
+import { viaLadder } from '../../platform/ladder';
 import { effectLine, windowChange, type WindowRead } from '../../core/effect';
-import { missText, untrusted, targetOf, targetText } from '../../core/miss-text';
+import { missText, structuredMissFields, untrusted, targetOf, targetText } from '../../core/miss-text';
 import { sleep } from '../../sleep';
 
 /** a11y_get_value returns a value whole up to this size (a long document, not a whole book). */
@@ -53,6 +58,26 @@ async function finderMap(ctx: AgentToolContext, rawMaxCost: unknown) {
   const map = await compileUIMap(defaultCompileDeps(ctx.platform, now, id), { max_cost: requested });
   holder.put(map, now, requested);
   return map;
+}
+
+/**
+ * No match on screen, but one scrolled out of view: name it, with the by-name call that reaches it. Out of view it has no
+ * place to click and no element_id, yet set_value and invoke by name work on it. Mac bench 2026-11-17 (web-long-read): the
+ * Answer field and Submit button at the end of a long page were out of view, find_field / find_button said "none" with no
+ * candidates, and four calls went into finding them.
+ */
+function withOffscreenMatch(
+  r: FindResult, map: UIMap, query: string,
+  find: (els: UIElement[], snapshotId: string, q: string) => FindResult,
+  next: (name: string) => string,
+): FindResult | (FindResult & { offscreen: { name: string; role: string }; next: string }) {
+  if (r.status !== 'none' || !map.offscreen?.length) return r;
+  // ui-map.ts strips their capabilities (nothing to click); the finders rank only clickable / editable elements.
+  const off = map.offscreen.map(e => ({ ...e, ...inferCapabilities({ role: e.role, source: 'a11y', enabled: e.state?.enabled !== false }) }));
+  const hit = find(off, map.snapshot_id, query);
+  if (hit.status !== 'ok') return r;
+  const name = off.find(e => e.id === hit.best.element_id)?.text ?? hit.best.label;
+  return { ...r, reason: `${r.reason}; one is scrolled out of view`, offscreen: { name, role: hit.best.role }, next: next(name) };
 }
 
 /** read_screen folds an embedded document of more elements than this into one line while it lists the app's own controls (#383). */
@@ -140,7 +165,9 @@ export function buildUnifiedTools(): UnifiedTool[] {
         const opaque = partial || (activeIsBrowser && sparse) ? null : opaqueArea(tree);
         const cdpStep = sparse || browser ? await cdpStepFor(ctx.cdp, pid ?? active?.processId) : '';
         const step = sparse ? cdpStep || nextStep : cdpStep;
-        const hint = (opaque ? `\n${opaqueAreaLine(opaque)}` : '') + (step ? `\n${step}` : '') +
+        // Not on a cut walk, whose panes may only be missing their children; a sparse tree and a browser get none (blind-hints.ts).
+        const drawn = partial ? null : drawnControlsLine(tree, browser);
+        const hint = (opaque ? `\n${opaqueAreaLine(opaque)}` : '') + (drawn ? `\n${drawn}` : '') + (step ? `\n${step}` : '') +
           (cut ? `\n${CUT_VALUE_NEXT_STEP}` : '');
         const awoke = woke ? ' (accessibility was asleep: read again after waking the app)' : '';
         const folded = fold ? `\n+ an embedded document or web view of ${content.length} elements — read_screen with offset:${own.length} lists them; copy_all_text reads its text` : '';
@@ -200,26 +227,32 @@ export function buildUnifiedTools(): UnifiedTool[] {
           const aw = await ctx.platform.getActiveWindow().catch(() => null);
           const plan = resolveRef(refIds, ctx.uiMaps, Date.now(), 'click', aw);
           if (!plan.ok) return { success: false, text: `invoke_element ref rejected: ${plan.error}`, isError: true };
-          if (plan.via === 'name') {
-            // A ref to a ListItem / combo-item / checkbox may not support
-            // InvokePattern: the same activation ladder as the by-name path below.
-            const { res: refRes, used: refUsed } = await runActivationLadder(
-              (action) => ctx.platform.invokeElement({ name: plan.name, action }), ['click', 'select', 'toggle']);
-            if (!refRes.success && canClickAtBounds(refRes)) {
-              const fallback = await clickBoundsFallback(ctx, plan.name, refRes.bounds);
-              if (fallback) return { ...fallback, text: `${fallback.text} (via ${plan.element.id})` };
+          if (plan.via === 'name' && plan.background) {
+            // A ref into a window that is not in front: the by-name act below, addressed to that process (R1 window
+            // messages, CDP, the ladder), so the focus is not moved and no click lands on the window in front.
+            args = { ...args, name: plan.name, processId: plan.processId };
+          } else {
+            if (plan.via === 'name') {
+              // A ref to a ListItem / combo-item / checkbox may not support
+              // InvokePattern: the same activation ladder as the by-name path below.
+              const { res: refRes, used: refUsed } = await runActivationLadder(
+                (action) => ctx.platform.invokeElement({ name: plan.name, action }), ['click', 'select', 'toggle']);
+              if (!refRes.success && canClickAtBounds(refRes)) {
+                const fallback = await clickBoundsFallback(ctx, plan.name, refRes.bounds);
+                if (fallback) return { ...fallback, text: `${fallback.text} (via ${plan.element.id})` };
+              }
+              await sleep(150);
+              return { success: refRes.success, text: refRes.success ? `Invoked ${quoteScreenText(plan.name)} via a11y${refUsed !== 'click' ? ` (${refUsed})` : ''} (via ${plan.element.id}).`
+                // The reason, as the name path gives it: an ambiguous name comes with the list of what it could mean.
+                : `a11y invoke of ${plan.element.id} missed — ${missText(refRes.data)}.`, targetLabel: plan.name };
             }
+            const seen = await boundsToClick(ctx, plan, aw);
+            if (!seen.ok) return { success: false, text: `invoke_element ref rejected: ${seen.error}`, isError: true };
+            const [bx, by, bw, bh] = seen.bounds;
+            await ctx.platform.mouseClick(Math.round(bx + bw / 2), Math.round(by + bh / 2));
             await sleep(150);
-            return { success: refRes.success, text: refRes.success ? `Invoked ${quoteScreenText(plan.name)} via a11y${refUsed !== 'click' ? ` (${refUsed})` : ''} (via ${plan.element.id}).`
-              // The reason, as the name path gives it: an ambiguous name comes with the list of what it could mean.
-              : `a11y invoke of ${plan.element.id} missed — ${missText(refRes.data)}.`, targetLabel: plan.name };
+            return { success: true, text: `Clicked ${plan.element.id} at its bounds center${plan.offView ? ' (scrolled into view first)' : ''}.`, targetLabel: plan.element.id };
           }
-          const seen = await boundsToClick(ctx, plan, aw);
-          if (!seen.ok) return { success: false, text: `invoke_element ref rejected: ${seen.error}`, isError: true };
-          const [bx, by, bw, bh] = seen.bounds;
-          await ctx.platform.mouseClick(Math.round(bx + bw / 2), Math.round(by + bh / 2));
-          await sleep(150);
-          return { success: true, text: `Clicked ${plan.element.id} at its bounds center${plan.offView ? ' (scrolled into view first)' : ''}.`, targetLabel: plan.element.id };
         }
         // `automationId` is accepted for MCP backward-compat but the PlatformAdapter
         // invokeElement interface does not expose automationId filtering — it is used
@@ -253,7 +286,13 @@ export function buildUnifiedTools(): UnifiedTool[] {
         // strict — the agent that asked to expand never silently gets a select.
         // Pure adapter-string retries → works on every OS with zero per-OS code,
         // and only the failing path pays the extra round-trips.
+        const page = action === 'click' ? await cdpOf(ctx, processId) : null;   // see set_field_value
+        if (page && (await page.clickByText(name).catch(() => null))?.success) {
+          ctx.platform.noteRoute?.(CDP_ROUTE);
+          return { success: true, text: `Invoked ${quoteScreenText(name)} via the page (browser).`, targetLabel: name };
+        }
         const ladder: InvokeAction[] = action === 'click' ? ['click', 'select', 'toggle'] : [action];
+        await wakeForNameSearch(ctx.platform, processId);
         const { res, used } = await runActivationLadder(
           (a) => ctx.platform.invokeElement({ name, controlType, processId, action: a, value, within }), ladder);
         // Found but no pattern took: click the surfaced bounds centre (same
@@ -280,7 +319,7 @@ export function buildUnifiedTools(): UnifiedTool[] {
                 ? `Invoked ${acted} (${used}) → value:\n${wrapUntrustedScreenContent(String((res.data as any).value ?? ''))}`
                 : `Invoked${expandReadBack(res.data) ? ' (read back ✓)' : ''} ${acted} via a11y${used !== 'click' ? ` (${used})` : ''}${expandNote(res.data)}.`
                   + (pending ? ' The action is still running — a dialog probably opened; re-read the screen before the next step.' : ''))
-            : `a11y invoke ${quoteScreenText(name)} missed — ${missText(res.data)}.`) + lateNote,
+            : `a11y invoke ${quoteScreenText(name)} missed — ${missText(res.data)}.${await onTopNote(ctx, res.data, processId)}`) + lateNote,
           targetLabel: name,
         };
       },
@@ -312,31 +351,37 @@ export function buildUnifiedTools(): UnifiedTool[] {
           const aw = await ctx.platform.getActiveWindow().catch(() => null);
           const plan = resolveRef(refIds, ctx.uiMaps, Date.now(), 'fill', aw);
           if (!plan.ok) return { success: false, text: `set_field_value ref rejected: ${plan.error}`, isError: true };
-          if (plan.via === 'name') {
-            const before = await valueBefore(ctx, { name: plan.name });
-            const res = await ctx.platform.invokeElement({ name: plan.name, action: 'set-value', value: fillValue });
+          if (plan.via === 'name' && plan.background) {
+            // A ref into a window that is not in front: the by-name act below, addressed to that process (R1 window
+            // messages, CDP, the ladder), so the focus is not moved and no click lands on the window in front.
+            args = { ...args, name: plan.name, processId: plan.processId };
+          } else {
+            if (plan.via === 'name') {
+              const before = await valueBefore(ctx, { name: plan.name });
+              const res = await ctx.platform.invokeElement({ name: plan.name, action: 'set-value', value: fillValue });
+              await sleep(150);
+              if (!res.success) return { success: false, text: `Set of ${plan.element.id} failed.`, targetLabel: plan.name };
+              return setResult(ctx.platform, fillValue, plan.name, ` (via ${plan.element.id})`, { name: plan.name },
+                { before, type: () => typeIntoField(ctx, fillValue, plan.name, undefined, undefined) });
+            }
+            const seen = await boundsToClick(ctx, plan, aw);
+            if (!seen.ok) return { success: false, text: `set_field_value ref rejected: ${seen.error}`, isError: true };
+            const [bx, by, bw, bh] = seen.bounds;
+            await ctx.platform.mouseClick(Math.round(bx + bw / 2), Math.round(by + bh / 2));
+            // No select-all when the click put the focus on the page or a document itself, or on a list or button: there it
+            // selects the whole page or every item. A text field or text area takes it; an unread focus keeps the old way.
+            const fe = await (async () => ctx.platform.getFocusedElement())().catch(() => null);
+            const scope = selectAllScope(fe);
+            if (scope === 'other' || (scope === 'document' && !fe?.multiline)) {
+              return { success: false, text: `set_field_value: clicked ${plan.element.id}, but the focus is not in a text field, so nothing was typed. Find the field (find_field) and set it by its element_id.`, isError: true };
+            }
+            // Replace, don't append: a set_value that types after the old text
+            // left "old textnew" in the Save-As box (live Windows check).
+            await ctx.platform.keyPress('mod+a');
+            await ctx.platform.typeText(fillValue);
             await sleep(150);
-            if (!res.success) return { success: false, text: `Set of ${plan.element.id} failed.`, targetLabel: plan.name };
-            return setResult(ctx.platform, fillValue, plan.name, ` (via ${plan.element.id})`, { name: plan.name },
-              { before, type: () => typeIntoField(ctx, fillValue, plan.name, undefined, undefined) });
+            return setResult(ctx.platform, fillValue, plan.element.id, ` (via bounds + select-all + type${plan.offView ? ', scrolled into view first' : ''})`);
           }
-          const seen = await boundsToClick(ctx, plan, aw);
-          if (!seen.ok) return { success: false, text: `set_field_value ref rejected: ${seen.error}`, isError: true };
-          const [bx, by, bw, bh] = seen.bounds;
-          await ctx.platform.mouseClick(Math.round(bx + bw / 2), Math.round(by + bh / 2));
-          // No select-all when the click put the focus on the page or a document itself, or on a list or button: there it
-          // selects the whole page or every item. A text field or text area takes it; an unread focus keeps the old way.
-          const fe = await (async () => ctx.platform.getFocusedElement())().catch(() => null);
-          const scope = selectAllScope(fe);
-          if (scope === 'other' || (scope === 'document' && !fe?.multiline)) {
-            return { success: false, text: `set_field_value: clicked ${plan.element.id}, but the focus is not in a text field, so nothing was typed. Find the field (find_field) and set it by its element_id.`, isError: true };
-          }
-          // Replace, don't append: a set_value that types after the old text
-          // left "old textnew" in the Save-As box (live Windows check).
-          await ctx.platform.keyPress('mod+a');
-          await ctx.platform.typeText(fillValue);
-          await sleep(150);
-          return setResult(ctx.platform, fillValue, plan.element.id, ` (via bounds + select-all + type${plan.offView ? ', scrolled into view first' : ''})`);
         }
         const name = String(args.name ?? '');
         const value = String(args.value ?? '');
@@ -347,6 +392,15 @@ export function buildUnifiedTools(): UnifiedTool[] {
         // A role alone is fine: the platform acts on the one field with that role, or refuses when several have it.
         if (!name.trim() && !controlType) {
           return { success: false, text: 'Set failed: name the field (its accessibility name), or pass element_id + snapshot_id from compile_ui. To type into the focused field, use type.', isError: true };
+        }
+        // The browser clawdcursor holds a CDP connection to: a DOM fill, where UIA's set would take its window to the front.
+        const page = await cdpOf(ctx, processId);
+        if (page && name.trim()) {
+          const r = await page.typeByLabel(name, value).catch(() => null);
+          if (r?.success) {
+            ctx.platform.noteRoute?.(CDP_ROUTE);
+            return { ...setVerdict(await readBackTyped(async () => r.read?.() ?? null, value, { whole: true }), value, name, ' (browser)'), targetLabel: name };
+          }
         }
         const field = { name, controlType: await preferControl(ctx.platform, 'set-value', { name, controlType, processId }), processId };
         const before = await valueBefore(ctx, field);
@@ -661,7 +715,10 @@ export function buildUnifiedTools(): UnifiedTool[] {
         await sleep(150);
         const after = await ctx.platform.getActiveWindow().catch(() => null);
         const note = warning ? ` (${warning})` : '';
-        const focusWarn = focusTheftWarning(activation, before, after);
+        // Another app in front after the click is the click WORKING when that app owns the point: ask only then.
+        const atPoint = windowChange(before, after) === 'other-app'
+          ? await ctx.platform.windowAtPoint?.(x, y).catch(() => null) : null;
+        const focusWarn = focusTheftWarning(activation, before, after, atPoint);
         return { success: true, text: `Clicked ${button} x${count} at ${coordBreadcrumb(ix, iy, x, y, space, scale, ctx)}${note}${focusWarn}${focusBreadcrumb(before, after)}` };
       },
     },
@@ -804,7 +861,13 @@ export function buildUnifiedTools(): UnifiedTool[] {
         ctx.platform.takeInputWarning?.();      // a warning left by some earlier keystrokes is not this call's
         const privateTyping = ctx.platform.typingIsPrivate?.() !== false;
         let how = 'keys';
-        if (typesAsKeys(body) && privateTyping) {
+        const wantKeys = typesAsKeys(body) && privateTyping;
+        // A clipboard of an image or a file cannot be put back after a paste: type the text instead, or refuse.
+        const choice = wantKeys || !body ? 'paste'
+          : pasteChoice(body, { nonTextClipboard: await ctx.platform.clipboardHoldsNonText?.().catch(() => false) ?? false, privateTyping });
+        if (choice === 'refuse') return { success: false, isError: true, text: CLIPBOARD_HELD_REFUSAL };
+        let restored = false;
+        if (wantKeys || choice === 'keys') {
           // Short plain text: real keystrokes, the user's clipboard never touched. A refusal (a system dialog owns the
           // keyboard) throws: nothing was typed, and the caller is told so.
           await ctx.platform.typeText(body);
@@ -824,6 +887,7 @@ export function buildUnifiedTools(): UnifiedTool[] {
             await waitForPaste(async () => (await ctx.platform.getFocusedElement())?.value, body, { minMs: 150 });
             await unguarded(() => ctx.platform.writeClipboard(prior!)).catch(() => {});
             prior = null;
+            restored = true;
           } catch (err) {
             // The paste failed or was refused: what was meant to be typed must not stay on the user's clipboard.
             if (prior !== null) await unguarded(() => ctx.platform.writeClipboard(prior!)).catch(() => {});
@@ -838,7 +902,7 @@ export function buildUnifiedTools(): UnifiedTool[] {
         // The verdict sits inside the leading "(…)", before any quoted text or window title, so content can never pose as
         // it (result-codes reads it from there).
         // Characters as a person counts them (an emoji is one), not UTF-16 units.
-        const head = `Typed ${[...text].length} chars (${how}${rb.result === 'match' ? ', read back ✓' : ''})`;
+        const head = `Typed ${[...text].length} chars (${how}${how === 'paste' && restored ? ', clipboard restored' : ''}${rb.result === 'match' ? ', read back ✓' : ''})`;
         // A password field: never echo what was typed into it.
         const shown = 'secure' in rb && rb.secure ? `${head} into a password field (not echoed)` : `${head}: "${truncate(text, 60)}"`;
         // What the field shows, as data, short: the evidence the caller needs.
@@ -1263,7 +1327,9 @@ export function buildUnifiedTools(): UnifiedTool[] {
       async execute(args, ctx) {
         const map = await finderMap(ctx, args.max_cost);
         if (!map) return { success: false, text: 'find_action_button: no UIMap holder on this context.' };
-        const r = findActionButton(map.elements, map.snapshot_id, String(args.intent ?? ''));
+        const intent = String(args.intent ?? '');
+        const r = withOffscreenMatch(findActionButton(map.elements, map.snapshot_id, intent), map, intent, findActionButton,
+          name => `accessibility {"action":"invoke","name":${JSON.stringify(name)}} (works out of view, no scrolling)`);
         return { success: r.status === 'ok', text: screenJson(r) };
       },
     },
@@ -1279,7 +1345,9 @@ export function buildUnifiedTools(): UnifiedTool[] {
       async execute(args, ctx) {
         const map = await finderMap(ctx, args.max_cost);
         if (!map) return { success: false, text: 'find_input_field: no UIMap holder on this context.' };
-        const r = findInputField(map.elements, map.snapshot_id, String(args.purpose ?? ''));
+        const purpose = String(args.purpose ?? '');
+        const r = withOffscreenMatch(findInputField(map.elements, map.snapshot_id, purpose), map, purpose, findInputField,
+          name => `accessibility {"action":"set_value","name":${JSON.stringify(name)},"value":"<text>"} (works out of view, no scrolling)`);
         return { success: r.status === 'ok', text: screenJson(r) };
       },
     },
@@ -1399,6 +1467,13 @@ export function buildUnifiedTools(): UnifiedTool[] {
     },
   ];
   return tools;
+}
+
+const CDP_ROUTE = 'CDP page act, focus not moved';
+
+/** The CDP driver when `pid` is the browser it is connected to (a by-name step on it is a page act), else null. */
+async function cdpOf(ctx: AgentToolContext, pid: number | undefined) {
+  return pid !== undefined && await cdpBrowserPid(ctx.cdp) === pid ? ctx.cdp! : null;
 }
 
 /**
@@ -1526,12 +1601,15 @@ async function clickBoundsFallback(
   const at = await clickablePoint(ctx, b);
   if (!at) return null;
   const { x: cx, y: cy } = at;
-  // A coordinate click hits whatever is on top. When the element was looked
-  // up in a named process (not the foreground window), raise that window
-  // first so the click can't land on a window covering it.
-  if (processId !== undefined) await ctx.platform.focusWindow({ processId }).catch(() => false);
-  await ctx.platform.mouseClick(cx, cy);
+  // A coordinate click hits whatever is on top. When the element was looked up in a named process (not the window in
+  // front), the ladder delivers the click to its window (R1), or brings that window up for a moment (R2), so the click
+  // can't land on a window covering it.
+  // replay:false — this is a fixed-coordinate click (cx,cy resolved before the burst); if the user interrupts and scrolls,
+  // re-clicking the old point could hit the wrong thing, so an interruption goes to R3 rather than replay.
+  const via = await viaLadder(ctx.platform, processId, { r1: { name, input: { click: true } }, r2: async act => { await act(() => ctx.platform.mouseClick(cx, cy)); } }, { replay: false });
+  if (via.rung === 'R3') return null;
   await sleep(150);
+  if (via.rung === 'R1') return { success: true, text: `Clicked ${quoteScreenText(name)} via a window message (the element exposes no invoke/toggle/select pattern).`, targetLabel: name };
   return { success: true, text: `Clicked ${quoteScreenText(name)} via a11y bounds (coordinate fallback at ${cx},${cy} — element found but exposes no invoke/toggle/select pattern).`, targetLabel: name };
 }
 
@@ -1678,16 +1756,29 @@ async function typeIntoField(
 ): Promise<Retyped> {
   const target = await editableTarget(ctx, name, controlType, processId, !secureOk);
   if (!target) return { skipped: `no editable field named ${quoteScreenText(name)} is on screen${secureOk ? '' : ' (a password field is never typed into on a guess)'}` };
-  const pid = processId ?? target.el.processId;
-  if (pid !== undefined && !await ensureInFront(ctx.platform, pid)) return { skipped: 'its window would not come to the front' };
-  await ctx.platform.mouseClick(target.x, target.y);
-  await sleep(100);
-  if (!focusIsField(await ctx.platform.getFocusedElement().catch(() => null), target.el, secureOk)) return 'unfocused';
-  await ctx.platform.keyPress('mod+a');
-  if (value) await ctx.platform.typeText(value);
-  else await ctx.platform.keyPress('Delete');
-  await sleep(150);
-  return 'typed';
+  const via = await viaLadder(ctx.platform, processId ?? target.el.processId, {
+    r1: { name, input: { setText: value } },
+    r2: async act => {
+      await act(() => ctx.platform.mouseClick(target.x, target.y));
+      await sleep(100);
+      if (!focusIsField(await ctx.platform.getFocusedElement().catch(() => null), target.el, secureOk)) return 'unfocused' as const;
+      await act(() => ctx.platform.keyPress('mod+a'));
+      if (value) await act(() => ctx.platform.typeText(value));
+      else await act(() => ctx.platform.keyPress('Delete'));
+      await sleep(150);
+      return 'typed' as const;
+    },
+  });
+  if (via.rung === 'R1') return 'typed';
+  return via.rung === 'R3' ? { skipped: via.why } : via.value;
+}
+
+/** The "another app's window is on top" line for a plain miss (not an ambiguous or hidden element), with its newline; else "". */
+async function onTopNote(ctx: AgentToolContext, miss: unknown, processId: number | undefined): Promise<string> {
+  const reason = structuredMissFields(miss).reason;
+  if (reason === 'ambiguous' || reason === 'hidden') return '';
+  const line = await onTopOfLine(ctx.platform, processId);
+  return line ? `\n${line}` : '';
 }
 
 /** macOS: " ⚠ …" when a modal dialog of another app had the keyboard during the keystrokes just sent, else "". */
@@ -1717,6 +1808,9 @@ export function focusTheftWarning(
   activation: { activated: boolean; title?: string; processName?: string; reason?: string; action?: string } | void,
   before: WindowRead,
   after: WindowRead,
+  /** The window at the click point after the click (platform.windowAtPoint), when the platform could say. */
+  atPoint?: { processId: number; hostedProcessId?: number } | null,
+  platform: NodeJS.Platform = process.platform,
 ): string {
   // The bridge deliberately refused to raise a self/host window (agent hub,
   // clawdcursor's own console) sitting over the click point — focus was NOT
@@ -1731,7 +1825,13 @@ export function focusTheftWarning(
       + ` over this coordinate, or resize/move the covering window out of the way.`;
   }
   const activationFailed = activation && activation.activated === false;
-  if (!activationFailed && windowChange(before, after) !== 'other-app') return '';
+  // Another app is in front, and it owns the clicked point: the click activated the app it hit. That is the click working.
+  const frontOwnsPoint = !!atPoint?.processId && ownsPoint(atPoint, after?.processId, after?.hostedProcessId);
+  if (!activationFailed && (windowChange(before, after) !== 'other-app' || frontOwnsPoint)) return '';
+  if (platform === 'darwin' && !activationFailed) {
+    const name = after?.processName || after?.appName || (after?.title ? quoteScreenText(truncateTitle(after.title)) : 'an unknown app');
+    return ` ⚠ another app is now in front: ${name}; check before typing.`;
+  }
   const landed = after?.title ? quoteScreenText(truncateTitle(after.title)) : 'an unknown window';
   return ` ⚠ FOCUS NOT CONFIRMED — the click may have landed on ${landed} instead of your target`
     + ` (the OS kept another window in front, or the point is over a different window). DO NOT type next:`

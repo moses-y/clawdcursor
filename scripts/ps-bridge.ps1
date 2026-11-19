@@ -67,6 +67,57 @@ try {
 "@
 } catch { }
 
+# The own-window rungs (docs/internal/own-window-plan.md): window messages to a control in another process (R1), the
+# foreground-lock workaround and the user's idle time (R2). Win32 return codes are passed on: 5 = access denied (UIPI).
+try {
+    Add-Type @"
+    using System;
+    using System.Collections.Generic;
+    using System.Runtime.InteropServices;
+    using System.Text;
+    public static class ClawdMsg {
+        delegate bool EnumProc(IntPtr h, IntPtr l);
+        [StructLayout(LayoutKind.Sequential)] struct LII { public uint cbSize; public uint dwTime; }
+        [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
+        [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
+        [DllImport("user32.dll", EntryPoint = "PostMessageW", SetLastError = true)] static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr SendStr(IntPtr h, uint m, IntPtr w, string l, uint flags, uint timeout, out IntPtr res);
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr SendBuf(IntPtr h, uint m, IntPtr w, StringBuilder l, uint flags, uint timeout, out IntPtr res);
+        [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LII p);
+        [DllImport("kernel32.dll")] static extern uint GetTickCount();
+
+        // A key event from this process lifts the foreground lock for its next SetForegroundWindow.
+        public static void AltTap() { keybd_event(0x12, 0, 0, UIntPtr.Zero); keybd_event(0x12, 0, 2, UIntPtr.Zero); }
+        // { tick of the last input, ms since it }: ANY input counts, this process's synthetic input too.
+        public static long[] Idle() {
+            LII p = new LII(); p.cbSize = (uint)Marshal.SizeOf(typeof(LII)); GetLastInputInfo(ref p);
+            return new long[] { p.dwTime, (long)(uint)(GetTickCount() - p.dwTime) };
+        }
+        public static long[] Children(long root) {
+            List<long> l = new List<long>();
+            EnumChildWindows(new IntPtr(root), delegate(IntPtr h, IntPtr x) { l.Add(h.ToInt64()); return true; }, IntPtr.Zero);
+            return l.ToArray();
+        }
+        public static string Cls(long h) { StringBuilder sb = new StringBuilder(256); GetClassName(new IntPtr(h), sb, 256); return sb.ToString(); }
+        public static long Style(long h) { return (uint)GetWindowLong(new IntPtr(h), -16); }
+        // WM_GETTEXT: a control's text in another process (GetWindowText returns only captions across processes).
+        public static string Text(long h) {
+            StringBuilder sb = new StringBuilder(8192); IntPtr r;
+            SendBuf(new IntPtr(h), 0x000D, new IntPtr(8192), sb, 2, 1500, out r);
+            return sb.ToString();
+        }
+        static int Err(bool ok) { if (ok) return 0; int e = Marshal.GetLastWin32Error(); return e == 0 ? 1460 : e; }
+        // 0 = delivered, else the Win32 error (5 = access denied: the target runs at a higher integrity level).
+        public static int SetText(long h, string s) { IntPtr r; return Err(SendStr(new IntPtr(h), 0x000C, IntPtr.Zero, s, 2, 1500, out r) != IntPtr.Zero); }
+        public static int Post(long h, uint m, long w, long l) { return Err(PostMessageW(new IntPtr(h), m, new IntPtr(w), new IntPtr(l))); }
+    }
+"@
+} catch { }
+
 # Register the managed UIA client-side proxies (Win32 Edit/Button/ComboBox/
 # ListView/... providers) from COMPILED code, before any UIA call. UIAutomation-
 # Client loads them lazily, ONCE, via a stack walk for the calling assembly; under
@@ -594,6 +645,13 @@ public static class ScreenPM {
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr h, int i);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  // Draws ONE window into a DC by itself: with PW_RENDERFULLCONTENT (2), its content even where other windows cover it.
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+  [DllImport("user32.dll")] public static extern IntPtr GetWindowDpiAwarenessContext(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr h, uint msg, IntPtr w, IntPtr l, uint flags, uint ms, out IntPtr result);
+  // PrintWindow waits for the window's thread: a hung or busy app would stall this bridge. A WM_NULL that it answers within
+  // `ms` (SMTO_BLOCK | SMTO_ABORTIFHUNG) says it is pumping its messages.
+  public static bool Responds(IntPtr h, uint ms) { IntPtr r; return SendMessageTimeout(h, 0, IntPtr.Zero, IntPtr.Zero, 0x3, ms, out r) != IntPtr.Zero; }
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out int v, int s);
   [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT v, int s);
   // WindowFromPoint takes a POINT BY VALUE: declared as (int x, int y) on x64
@@ -688,6 +746,52 @@ function Cmd-CaptureRect {
     } finally { [ScreenPM]::Restore($prev) }
 }
 
+# ── Command: capture-window ───────────────────────────────────────────────────
+# One window of a process, drawn by itself: PrintWindow with PW_RENDERFULLCONTENT renders the window's own content, so
+# a window behind others is read without what covers it, and nothing is raised or focused. The pid's largest normal
+# window (not a topmost / tool window), not minimized: a minimized window draws only its title bar. Physical pixels
+# (per-monitor aware): x, y is where the window's top-left is on the virtual desktop.
+function Cmd-CaptureWindow {
+    param($cmd)
+    Add-Type -AssemblyName System.Drawing
+    $prev = [ScreenPM]::Aware()
+    try {
+        $best = $null; $bestArea = 0; $bestRect = $null
+        $candidates = Get-PidWindowCandidates ([int]$cmd.pid)   # returned as one array (`return ,$found`): assigned, not wrapped
+        foreach ($c in @($candidates)) {
+            if ($null -eq $c -or $c.Aux -or [ScreenPM]::IsIconic($c.Handle)) { continue }
+            $r = New-Object ScreenPM+RECT
+            if (-not [ScreenPM]::GetWindowRect($c.Handle, [ref]$r)) { continue }
+            $area = [int64]($r.R - $r.L) * [int64]($r.B - $r.T)
+            if ($area -gt $bestArea) { $best = $c.Handle; $bestArea = $area; $bestRect = $r }
+        }
+        if ($null -eq $best) { return @{ success = $false; reason = 'no-window' } }
+        # The window draws at its OWN size: a DPI-unaware app's window is smaller than its physical rect. Sized in the
+        # window's DPI context; the physical rect above says where it is, and the caller scales between the two.
+        $own = $bestRect
+        $ctx = [ScreenPM]::GetWindowDpiAwarenessContext($best)
+        if ($ctx -ne [IntPtr]::Zero) {
+            $was = [ScreenPM]::SetThreadDpiAwarenessContext($ctx)
+            try { $o = New-Object ScreenPM+RECT; if ([ScreenPM]::GetWindowRect($best, [ref]$o)) { $own = $o } }
+            finally { if ($was -ne [IntPtr]::Zero) { [void][ScreenPM]::SetThreadDpiAwarenessContext($was) } }
+        }
+        $iw = $own.R - $own.L; $ih = $own.B - $own.T
+        if ($iw -le 0 -or $ih -le 0) { return @{ success = $false; reason = 'no-window' } }
+        if (-not [ScreenPM]::Responds($best, 1000)) { return @{ success = $false; reason = 'not-responding' } }
+        $bmp = New-Object System.Drawing.Bitmap $iw, $ih
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $drawn = $false
+        try { $dc = $g.GetHdc(); try { $drawn = [ScreenPM]::PrintWindow($best, $dc, 2) } finally { $g.ReleaseHdc($dc) } } finally { $g.Dispose() }
+        if (-not $drawn) { $bmp.Dispose(); return @{ success = $false; reason = 'not-drawn' } }
+        $title = ''
+        try { $title = [System.Windows.Automation.AutomationElement]::FromHandle($best).Current.Name } catch {}
+        $ms = New-Object System.IO.MemoryStream
+        $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); $bmp.Dispose()
+        return @{ success = $true; x = $bestRect.L; y = $bestRect.T; width = $bestRect.R - $bestRect.L; height = $bestRect.B - $bestRect.T
+                  imageWidth = $iw; imageHeight = $ih; title = $title; handle = [int64]$best; png = [Convert]::ToBase64String($ms.ToArray()) }
+    } finally { [ScreenPM]::Restore($prev) }
+}
+
 # ── Command: activate-at-point ────────────────────────────────────────────────
 # Before a coordinate click, ensure the window at (x, y) is the foreground.
 # This prevents clicks from landing on a background window when a dialog sits
@@ -770,6 +874,37 @@ function Cmd-ActivateAtPoint {
         processName = $rootNameEarly
         title     = $rootTitleEarly
     }
+}
+
+# ── Command: window-at-point ──────────────────────────────────────────────────
+# Read-only twin of activate-at-point: who owns the window a user SEES at (x, y)
+# (physical virtual-desktop pixels), without raising anything. smart_click uses it
+# to refuse a click that would land in another app's window (a system dialog over
+# the target). A denylisted self/host window or no window answers processId 0 = unknown.
+function Cmd-WindowAtPoint {
+    param($cmd)
+    $hwnd = [ScreenPM]::WindowAt([int]$cmd.x, [int]$cmd.y)
+    if ($hwnd -eq [IntPtr]::Zero) { return @{ success=$true; processId=0 } }
+    $root = [Win32UIA]::GetAncestor($hwnd, 2)
+    if ($root -eq [IntPtr]::Zero) { $root = $hwnd }
+    $procId = 0
+    [void][Win32UIA]::GetWindowThreadProcessId($root, [ref]$procId)
+    $name = "unknown"; $title = ""
+    try { $name = [System.Diagnostics.Process]::GetProcessById($procId).ProcessName } catch {}
+    # A Store app's frame belongs to ApplicationFrameHost, one process for every Store app. Window lists keep that as
+    # the window's processId and name the app by its CoreWindow child (Get-HostedApp: hostedProcessId), so a caller may
+    # target either: report both, and the click check accepts a match on either.
+    $hosted = 0; $hostedName = ''
+    $cls = ''; try { $cls = [ScreenPM]::ClassOf($root) } catch {}
+    $app = Get-HostedApp $root $cls ([int]$procId)
+    if ($app) { $hosted = $app.processId; $hostedName = $app.processName }
+    try {
+        $el = [System.Windows.Automation.AutomationElement]::FromHandle($root)
+        if ($el) { $title = $el.Current.Name }
+    } catch {}
+    if (Test-ForegroundDenylisted $name $title) { return @{ success=$true; processId=0 } }
+    if ($hosted) { return @{ success=$true; processId=$procId; processName=$name; title=$title; hostedProcessId=$hosted; hostedProcessName=$hostedName } }
+    return @{ success=$true; processId=$procId; processName=$name; title=$title }
 }
 
 # -- Command: pid-at-point -----------------------------------------------------
@@ -1097,6 +1232,143 @@ function Cmd-FocusWindow {
         # Rect.Empty (infinite X) for a window UIA deems not displayed: no bounds.
         bounds     = $(if ($c.BoundingRectangle.IsEmpty) { $null } else { @{ x = [int]$c.BoundingRectangle.X; y = [int]$c.BoundingRectangle.Y; width = [int]$c.BoundingRectangle.Width; height = [int]$c.BoundingRectangle.Height } })
     }
+}
+
+# ── Command: restore-foreground ───────────────────────────────────────────────
+# Put window `handle` back in front after an act took the foreground (a UIA SetValue / Invoke can). Same lock workaround
+# as focus-window plus the Alt key event from this process that actually lifts it; verified by reading the foreground back.
+function Cmd-RestoreForeground {
+    param($cmd)
+    $hwnd = [IntPtr][int64]$cmd.handle
+    if ($hwnd -eq [IntPtr]::Zero) { return @{ success = $false; restored = $false; error = 'no handle' } }
+    if ([Win32UIA]::GetForegroundWindow() -eq $hwnd) { return @{ success = $true; restored = $true } }
+    $me = [Win32UIA]::GetCurrentThreadId()
+    $fgThread = 0
+    $fg = [Win32UIA]::GetForegroundWindow()
+    if ($fg -ne [IntPtr]::Zero) { $p = 0; $fgThread = [Win32UIA]::GetWindowThreadProcessId($fg, [ref]$p) }
+    $attached = $false
+    if ($fgThread -ne 0 -and $fgThread -ne $me) {
+        try { [Win32UIA]::AttachThreadInput($me, $fgThread, $true) | Out-Null; $attached = $true } catch {}
+    }
+    try {
+        [ClawdMsg]::AltTap()
+        [Win32UIA]::AllowSetForegroundWindow(-1) | Out-Null
+        [Win32UIA]::SetForegroundWindow($hwnd) | Out-Null
+    } finally {
+        if ($attached) { try { [Win32UIA]::AttachThreadInput($me, $fgThread, $false) | Out-Null } catch {} }
+    }
+    Start-Sleep -Milliseconds 40
+    $ok = ([Win32UIA]::GetForegroundWindow() -eq $hwnd)
+    return @{ success = $ok; restored = $ok }
+}
+
+# ── Command: get-idle ─────────────────────────────────────────────────────────
+# GetLastInputInfo: the tick of the last input of ANY kind (this process's synthetic input too) and the ms since it.
+function Cmd-GetIdle {
+    $i = [ClawdMsg]::Idle()
+    return @{ success = $true; tick = $i[0]; idleMs = $i[1] }
+}
+
+# ── Command: deliver-to-window (rung R1) ──────────────────────────────────────
+# Text, a whole value or a click for a control of a BACKGROUND window, by window messages: no focus, no cursor.
+# Native Win32 / WinForms / WPF-hosted edits and buttons take them; Chromium and Electron ignore them (CDP is their route).
+# Refused: the user's foreground window, a password edit, a Chromium window. An elevated target (UIPI) answers access
+# denied: reported as `uipi`, never retried.
+function Find-DeliverControl {
+    param([long]$root, [string]$kind, [string]$name)
+    $want = if ($kind -eq 'click') { 'BUTTON' } else { 'EDIT' }
+    $cands = @()
+    foreach ($h in [ClawdMsg]::Children($root)) {
+        if (-not ([ClawdMsg]::Cls($h) -match $want)) { continue }
+        $st = [ClawdMsg]::Style($h)
+        if (($st -band 0x10000000) -eq 0 -or ($st -band 0x08000000) -ne 0) { continue }   # WS_VISIBLE, WS_DISABLED
+        $cands += [int64]$h
+    }
+    if (-not $name) {
+        if ($cands.Count -eq 1) { return @{ handle = $cands[0] } }
+        return @{ reason = $(if ($cands.Count -eq 0) { 'no-control' } else { 'ambiguous' }) }
+    }
+    $w = $name.Trim().ToLowerInvariant()
+    $exact = $null; $part = $null
+    foreach ($h in $cands) {
+        $names = @(([ClawdMsg]::Text($h) -replace '&', '').Trim().ToLowerInvariant())
+        try { $names += [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$h).Current.Name.Trim().ToLowerInvariant() } catch {}
+        if ($null -eq $exact -and ($names -contains $w)) { $exact = $h }
+        if ($null -eq $part -and (@($names | Where-Object { $_ -and $_.Contains($w) }).Count -gt 0)) { $part = $h }
+    }
+    $pick = if ($null -ne $exact) { $exact } else { $part }
+    if ($null -eq $pick) { return @{ reason = 'no-control' } }
+    return @{ handle = $pick }
+}
+
+function Cmd-DeliverToWindow {
+    param($cmd)
+    $props = $cmd.PSObject.Properties.Name
+    $kind = @('text', 'setText', 'click' | Where-Object { $props -contains $_ -and $null -ne $cmd.$_ -and -not ($cmd.$_ -is [bool] -and -not $cmd.$_) })
+    if ($kind.Count -ne 1) { return @{ success = $false; reason = 'bad-input'; error = 'give exactly one of text, setText, click' } }
+    $kind = $kind[0]
+    $roots = @()
+    if ($cmd.handle) {
+        $r = [Win32UIA]::GetAncestor([IntPtr][int64]$cmd.handle, 2)
+        $roots = @([int64]$(if ($r -eq [IntPtr]::Zero) { [IntPtr][int64]$cmd.handle } else { $r }))
+    } elseif ($cmd.processId) {
+        $roots = @(Get-PidWindowCandidates ([int]$cmd.processId) | ForEach-Object { [int64]$_.Handle })
+    }
+    $fg = [Win32UIA]::GetForegroundWindow()
+    $fgRoot = [int64]$(if ($fg -eq [IntPtr]::Zero) { [IntPtr]::Zero } else { [Win32UIA]::GetAncestor($fg, 2) })
+    $back = @($roots | Where-Object { $_ -ne $fgRoot -and $_ -ne [int64]$fg })
+    if ($back.Count -eq 0) {
+        if ($roots.Count -gt 0) { return @{ success = $false; reason = 'user-foreground'; error = 'that window is the one in front: nothing is sent to the user''s foreground window' } }
+        return @{ success = $false; reason = 'no-window'; error = 'no window to deliver to' }
+    }
+    $found = $null; $miss = 'no-control'
+    foreach ($root in $back) {
+        if ([ClawdMsg]::Cls($root) -like 'Chrome_WidgetWin*') { $miss = 'use-cdp'; continue }
+        $f = Find-DeliverControl $root $kind ([string]$cmd.name)
+        if ($f.handle) { $found = $f.handle; break }
+        if ($f.reason -eq 'ambiguous' -or $miss -ne 'use-cdp') { $miss = $f.reason }
+    }
+    if ($null -eq $found) {
+        $why = @{ 'use-cdp' = 'a Chromium / Electron window ignores posted input: use its page route (CDP)'; 'ambiguous' = 'several controls could take it: name one'; 'no-control' = 'no matching edit / button control with a window handle' }[$miss]
+        return @{ success = $false; reason = $miss; error = $why }
+    }
+    $cls = [ClawdMsg]::Cls($found)
+    $control = @{ class = $cls; handle = $found }
+    if ($kind -ne 'click' -and (([ClawdMsg]::Style($found) -band 0x20) -ne 0)) {   # ES_PASSWORD
+        return @{ success = $false; reason = 'secure-field'; error = 'a password field takes nothing posted to it'; control = $control }
+    }
+    $fail = {
+        param($code)
+        if ($code -eq 5) { return @{ success = $false; reason = 'uipi'; error = 'the window runs elevated (higher integrity): Windows blocks messages to it'; control = $control } }
+        return @{ success = $false; reason = 'post-failed'; error = "the message was not delivered (Win32 error $code)"; control = $control }
+    }
+    $norm = { param($t) ([string]$t) -replace "`r`n", "`n" -replace "`r", "`n" }
+    if ($kind -eq 'click') {
+        $code = [ClawdMsg]::Post($found, 0x00F5, 0, 0)   # BM_CLICK
+        if ($code -ne 0) { return (& $fail $code) }
+        return @{ success = $true; rung = 'R1'; method = 'BM_CLICK'; verified = $false; control = $control }
+    }
+    if ($kind -eq 'setText') {
+        $code = [ClawdMsg]::SetText($found, [string]$cmd.setText)   # WM_SETTEXT
+        if ($code -ne 0) { return (& $fail $code) }
+        $same = ((& $norm ([ClawdMsg]::Text($found))) -ceq (& $norm $cmd.setText))
+        return @{ success = $true; rung = 'R1'; method = 'WM_SETTEXT'; verified = $same; control = $control }
+    }
+    $typed = & $norm $cmd.text
+    $before = (& $norm ([ClawdMsg]::Text($found))).Length
+    foreach ($ch in ([string]$cmd.text).ToCharArray()) {
+        $code = [int]$ch; if ($code -eq 10) { $code = 13 }
+        $e = [ClawdMsg]::Post($found, 0x0102, $code, 0)   # WM_CHAR
+        if ($e -ne 0) { return (& $fail $e) }
+    }
+    # Posted, so the control takes it a moment later: read back until it grew by what was typed.
+    $ok = $false
+    for ($i = 0; $i -lt 10 -and -not $ok; $i++) {
+        $now = & $norm ([ClawdMsg]::Text($found))
+        $ok = ($now.Length -eq $before + $typed.Length) -and $now.Contains($typed)
+        if (-not $ok) { Start-Sleep -Milliseconds 40 }
+    }
+    return @{ success = $true; rung = 'R1'; method = 'WM_CHAR'; verified = $ok; control = $control }
 }
 
 # ── Command: find-element (fuzzy name match) ──────────────────────────────────
@@ -2119,17 +2391,22 @@ while ($true) {
             "get-process-paths"     { Cmd-GetProcessPaths $cmd }
             "list-windows"          { Cmd-ListWindows }
             "focus-window"          { Cmd-FocusWindow $cmd }
+            "restore-foreground"    { Cmd-RestoreForeground $cmd }
+            "deliver-to-window"     { Cmd-DeliverToWindow $cmd }
+            "get-idle"              { Cmd-GetIdle }
             "find-element"          { Cmd-FindElement $cmd }
             "invoke-element"        { Cmd-InvokeElement $cmd }
             "scroll-into-view"      { Cmd-ScrollIntoView $cmd }
             "get-focused-element"   { Cmd-GetFocusedElement }
             "get-page-text"         { Cmd-GetPageText $cmd }
             "activate-at-point"     { Cmd-ActivateAtPoint $cmd }
+            "window-at-point"       { Cmd-WindowAtPoint $cmd }
             "pid-at-point"          { Cmd-PidAtPoint $cmd }
             "list-displays"         { Cmd-ListDisplays }
             "move-cursor"           { Cmd-MoveCursor $cmd }
             "get-cursor"            { Cmd-GetCursor }
             "capture-rect"          { Cmd-CaptureRect $cmd }
+            "capture-window"        { Cmd-CaptureWindow $cmd }
             "ocr"                   { Cmd-Ocr $cmd }
             "ping"                  { @{ pong=$true } }
             default                 { @{ error="Unknown command: $($cmd.cmd)" } }
