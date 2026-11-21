@@ -48,6 +48,7 @@ vi.mock('../core/banner', () => ({
 import { createMcpServer, type McpServerLike, type McpToolResult } from '../surface/mcp-server';
 import type { ToolContext } from '../tools/registry';
 import { logger } from '../core/observability/logger';
+import * as path from 'path';
 
 // ── Minimal fake ToolContext — matches mcp-server.test.ts fakeCtx() ──────────
 function fakeCtx(): ToolContext {
@@ -318,7 +319,7 @@ describe('--no-vision: no screenshot reaches the MCP client\'s model', () => {
     desktop: { captureForLLM: vi.fn(async () => ({ buffer: Buffer.from('pixels'), llmWidth: 10, llmHeight: 10, width: 10, height: 10, scaleFactor: 1 })) },
   });
   const latestShot = async () => (await import('../core/screen-binding')).latestShotId();
-  const REFUSED = /vision is disabled on this server[\s\S]*\[refused · VISION_DISABLED · .*next: accessibility \{"action":"compile_ui"\}/;
+  const REFUSED = /vision is disabled on this server[\s\S]*\[refused · VISION_DISABLED · .*next: the (?:accessibility tool, action compile_ui|compile_ui tool)/;
 
   // Every surface a screenshot can be taken from: the compact compound, and the two granular screenshot tools.
   const calls: Array<{ compact: boolean; name: string; args: Record<string, unknown> }> = [
@@ -381,7 +382,7 @@ describe('the first screenshot of a session that read nothing is nudged to blind
     await createMcpServer({ ctx: shotCtx(), compact: true });
     const r = await capturedHandlers.get('computer')!({ action: 'screenshot' });
     expect(text(r)).toMatch(/A screenshot before any text was read\. Cheaper and exact:/);
-    expect(text(r)).toMatch(/If the target has a visible label, click it with accessibility \{"action":"smart_click","target":"<label>"\} instead of coordinates\./);
+    expect(text(r)).toMatch(/If the target has a visible label, click it with the accessibility tool, action smart_click, target "<label>" instead of coordinates\./);
   });
 
   it('a screenshot after a blind read in the same session is not nudged', async () => {
@@ -417,6 +418,21 @@ describe('the first screenshot of a session that read nothing is nudged to blind
     expect(first).toMatch(/send all remaining strokes in ONE batch \(computer click with path, drag_path\), then ONE computer screenshot_region of only the changed area with max_edge 512/);
     expect(first).not.toMatch(/Cheaper and exact/);
     for (let i = 0; i < 3; i++) expect(text(await capturedHandlers.get('computer')!({ action: 'screenshot' }))).not.toMatch(/\[clawdcursor\]/);
+  });
+
+  // #410: a click between two screenshots left the streak at 1 and reset the flag, so the canvas advice came a second time.
+  it('the canvas advice is not repeated after a click between two screenshots', async () => {
+    const tree = [{ name: 'Board app', controlType: 'Window', bounds: { x: 0, y: 0, width: 1000, height: 800 } },
+      ...Array.from({ length: 9 }, (_, i) => ({ name: `Tool ${i}`, controlType: 'Button', bounds: { x: i * 40, y: 0, width: 36, height: 36 } })),
+      { name: 'Board', controlType: 'Pane', bounds: { x: 0, y: 100, width: 1000, height: 700 } }];
+    const base = shotCtx();
+    const ctx = { ...base, platform: { ...base.platform, getUiTree: vi.fn(async () => tree), lastTreeTruncated: false, mouseClick: vi.fn(async () => {}) } };
+    await createMcpServer({ ctx, compact: true });
+    await capturedHandlers.get('accessibility')!({ action: 'read_tree' });
+    const hints = [text(await capturedHandlers.get('computer')!({ action: 'screenshot' }))];
+    await capturedHandlers.get('computer')!({ action: 'click', x: 500, y: 400, space: 'screen' });
+    hints.push(text(await capturedHandlers.get('computer')!({ action: 'screenshot' })));
+    expect(hints.filter(t => /strokes/.test(t))).toHaveLength(1);
   });
 
   // A missed name says nothing about the window: an agent on a form whose button is "Send", not "Submit", gets no drawing advice.
@@ -477,12 +493,12 @@ describe('coordinate clicks with none by name are nudged to smart_click, once', 
   it('compact and granular name smart_click in their own names', async () => {
     await createMcpServer({ ctx: ctx(), compact: true });
     for (let i = 0; i < 2; i++) await click();
-    expect(text(await click())).toContain('accessibility smart_click {"target":"<label>"} presses it with no screenshot');
+    expect(text(await click())).toContain('the accessibility tool, action smart_click, target "<label>" presses it with no screenshot');
     capturedHandlers.clear();
     await createMcpServer({ ctx: ctx(), compact: false });
     for (let i = 0; i < 2; i++) await click(false);
     const g = text(await click(false));
-    expect(g).toContain('smart_click {"target":"<label>"} presses it with no screenshot');
+    expect(g).toContain('the smart_click tool, target "<label>" presses it with no screenshot');
     expect(g).not.toContain('accessibility smart_click');
   });
 
@@ -504,5 +520,25 @@ describe('coordinate clicks with none by name are nudged to smart_click, once', 
     await click(); await click();
     for (let i = 0; i < 3; i++) expect(NUDGE.test(text(await scroll()))).toBe(false);
     expect(NUDGE.test(text(await click()))).toBe(true);
+  });
+});
+
+describe("downloads the agent's browser kept", () => {
+  beforeEach(() => {
+    capturedHandlers.clear();
+    vi.clearAllMocks();
+    mockClientCaps.mockReturnValue(undefined);
+    mockHasConsent.mockReturnValue(true);
+  });
+
+  it('are named once, in a block of their own after the result, which stays exactly as it was', async () => {
+    const saved = [path.join('Downloads', 'Hopetoun_falls.jpg')];
+    await createMcpServer({ ctx: { ...fakeCtx(), cdp: { takeSavedDownloads: () => saved.splice(0) } }, compact: true });
+    const system = capturedHandlers.get('system')!;
+    const r = await system({ action: 'build_uri', scheme: 'mailto', path: 'a@b.com' });
+    const texts = r.content.filter(c => c.type === 'text').map(c => (c as { text: string }).text);
+    expect(texts).toEqual(['mailto:a@b.com', `Downloaded to: "${path.join('Downloads', 'Hopetoun_falls.jpg')}"`]);
+    const again = await system({ action: 'build_uri', scheme: 'mailto', path: 'a@b.com' });
+    expect(again.content).toHaveLength(1);
   });
 });

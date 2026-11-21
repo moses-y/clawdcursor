@@ -333,7 +333,7 @@ describe('7. type tool — keys for short text, verified paste for long text, re
 
   it('read back: the field shows the text → "read back ✓"', async () => {
     const ctx = makeCtx();
-    (ctx.platform as any).getFocusedElement = vi.fn(async () => ({ name: 'Search', controlType: 'Edit', value: 'prefix Hello World', bounds: { x: 0, y: 0, width: 1, height: 1 } }));
+    (ctx.platform as any).getFocusedElement = vi.fn(async () => ({ name: 'Search', controlType: 'Edit', value: 'Hello World', bounds: { x: 0, y: 0, width: 1, height: 1 } }));
     const result = await findTool(buildUnifiedTools(), 'type').execute({ text: 'Hello World' }, ctx);
     expect(result.text.startsWith('Typed 11 chars (keys, read back ✓): "Hello World"')).toBe(true);
   });
@@ -383,11 +383,12 @@ describe('7. type tool — keys for short text, verified paste for long text, re
     expect(ctx.platform.keyPress).not.toHaveBeenCalledWith('Return');
   });
 
-  it('read back without a submit: the text anywhere in the field is a match (existing content is fine)', async () => {
+  it('read back without a submit: the text inside a longer value is NOT ✓ (the whole field must be what was typed); the reply names the value', async () => {
     const ctx = makeCtx();
     (ctx.platform as any).getFocusedElement = vi.fn(async () => ({ name: 'Doc', controlType: 'Document', value: 'before Hello World after', bounds: { x: 0, y: 0, width: 1, height: 1 } }));
     const result = await findTool(buildUnifiedTools(), 'type').execute({ text: 'Hello World' }, ctx);
-    expect(result.text).toMatch(/^Typed 11 chars \(keys, read back ✓\)/);
+    expect(result.text).not.toContain('read back ✓');
+    expect(result.text).toMatch(/the field now holds [\s\S]*before Hello World after[\s\S]* \(not only what was typed\)/);
   });
 
   it('where typing is not private (the text would be visible to other processes) short text is pasted instead', async () => {
@@ -423,6 +424,27 @@ describe('7. type tool — keys for short text, verified paste for long text, re
     expect(result.success).toBe(false);
     expect(result.text).toMatch(/if it is right, press Return/);
     expect(result.text).toMatch(/\(555\) 123-4567/);
+  });
+
+  // Chrome on its profile picker: the typed URL went to a page, and the reply blamed an autocomplete suggestion.
+  it('a submit held while the focus is not on a text field says where the focus is, not that a suggestion took over', async () => {
+    const ctx = makeCtx();
+    (ctx.platform as any).getFocusedElement = vi.fn(async () => ({ name: 'Who is using Chrome?', controlType: 'Pane', value: 'Who is using Chrome?', bounds: { x: 0, y: 0, width: 1, height: 1 } }));
+    const result = await findTool(buildUnifiedTools(), 'type').execute({ text: 'example.com\n' }, ctx);
+    expect(result.success).toBe(false);
+    expect(result.text).toContain("the focus is on Pane 'Who is using Chrome?', not a text field — Return not pressed");
+    expect(result.text).not.toMatch(/suggestion|autocomplete/);
+    expect(ctx.platform.keyPress).not.toHaveBeenCalledWith('Return');
+  });
+
+  it('an edit, document or combo box keeps the suggestion wording', async () => {
+    for (const controlType of ['Edit', 'Document', 'ComboBox']) {
+      const ctx = makeCtx();
+      (ctx.platform as any).getFocusedElement = vi.fn(async () => ({ name: 'Address', controlType, value: 'example.com/more', bounds: { x: 0, y: 0, width: 1, height: 1 } }));
+      const result = await findTool(buildUnifiedTools(), 'type').execute({ text: 'example.com\n' }, ctx);
+      expect(result.text, controlType).toContain('an autocomplete suggestion');
+      expect(result.text, controlType).not.toContain('not a text field');
+    }
   });
 
   it('a refused keystroke (a system dialog owns the keyboard) throws: nothing typed, and the clipboard untouched', async () => {

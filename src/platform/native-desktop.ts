@@ -15,7 +15,7 @@ import { beforePointerPress, guardInputMethods } from './pointer-guard';
 import os from 'os';
 import sharp from 'sharp';
 import { mouse, keyboard, screen, Button, Key, Point } from '@nut-tree-fork/nut-js';
-import { normalizeKey, modifierOf } from './keys';
+import { normalizeKey, modifierOf, splitCombo } from './keys';
 import { getNativeHelper, captureScreenViaHelper, ScreenRecordingDeniedError } from './native-helper';
 import { rawScreenGrab } from './screen-grab';
 import { sharpFromGrab, type GrabImage } from './grab-image';
@@ -529,9 +529,20 @@ export class NativeDesktop {
 
   // --- Input Methods ---
 
+  /**
+   * On a Wayland session nut-js reaches no window: its events are dropped, and the call would still say it was done. Input
+   * goes through the Linux adapter instead, which sends it with ydotool / wtype or throws that there is no such tool.
+   */
+  private async waylandInput(): Promise<import('./types').PlatformAdapter | null> {
+    if (process.platform !== 'linux' || !isWaylandSession()) return null;
+    return (await import('./index')).getPlatform();
+  }
+
   async mouseClick(x: number, y: number, button: number = 1): Promise<void> {
     await beforePointerPress(); // clawdcursor's own pill must not be under the click
     if (!this.connected) throw new Error('Not connected');
+    const wl = await this.waylandInput();
+    if (wl) { await wl.mouseClick(x, y, { button: button === 2 ? 'middle' : button === 4 ? 'right' : 'left' }); return; }
     // On macOS: skip the Swift helper (CGEvent blocked by TCC), use nut-js directly.
     // nut-js mouse events ARE delivered on macOS (unlike CGEvent from child processes).
     // physicalToMouse: callers pass PHYSICAL coords (image×imageScale / a11y / OCR);
@@ -547,6 +558,8 @@ export class NativeDesktop {
   async mouseDoubleClick(x: number, y: number): Promise<void> {
     await beforePointerPress(); // clawdcursor's own pill must not be under the click
     if (!this.connected) throw new Error('Not connected');
+    const wl = await this.waylandInput();
+    if (wl) { await wl.mouseClick(x, y, { count: 2 }); return; }
     await this.placePointer(x, y);
     await this.delay(50);
     await mouse.doubleClick(Button.LEFT);
@@ -556,6 +569,8 @@ export class NativeDesktop {
   async mouseRightClick(x: number, y: number): Promise<void> {
     await beforePointerPress(); // clawdcursor's own pill must not be under the click
     if (!this.connected) throw new Error('Not connected');
+    const wl = await this.waylandInput();
+    if (wl) { await wl.mouseClick(x, y, { button: 'right' }); return; }
     await this.placePointer(x, y);
     await this.delay(50);
     await mouse.rightClick();
@@ -587,6 +602,8 @@ export class NativeDesktop {
 
   async typeText(text: string): Promise<void> {
     if (!this.connected) throw new Error('Not connected');
+    const wl = await this.waylandInput();
+    if (wl) { await wl.typeText(text); return; }
     if (IS_MAC) {
       // Use System Events for typing — same reason as keyPress:
       // CGEvent from helper subprocess is silently blocked by TCC.
@@ -606,10 +623,9 @@ export class NativeDesktop {
         await runAppleScript(`tell application "System Events" to keystroke "${escaped}"`, 10000);
       } catch (err: any) {
         console.warn(`   ⌨️  macOS type failed: ${err.message?.substring(0, 100)}`);
-        // Fallback: try helper anyway
-        if (this.helper) {
-          await this.helper.type(text);
-        }
+        // Fallback: try helper anyway. With no helper the text was not typed, and the caller must hear it (it reported done).
+        if (!this.helper) throw err;
+        await this.helper.type(text);
       }
       return;
     }
@@ -619,6 +635,8 @@ export class NativeDesktop {
 
   async keyPress(keyCombo: string): Promise<void> {
     if (!this.connected) throw new Error('Not connected');
+    const wl = await this.waylandInput();
+    if (wl) { await wl.keyPress(keyCombo); return; }
     if (IS_MAC) {
       // macOS: use System Events via osascript for reliable keystroke delivery.
       // CGEvent.post() from a spawned helper is silently blocked by TCC on macOS 15+
@@ -637,7 +655,7 @@ export class NativeDesktop {
       return;
     }
 
-    const parts = keyCombo.split('+').map(k => k.trim()).filter(k => k.length > 0);
+    const parts = splitCombo(keyCombo);
     const keys = parts.map(k => this.mapKey(k));
 
     // If the only key is a TYPE_CHAR (single printable char like *, +, ., etc.),
@@ -676,25 +694,26 @@ export class NativeDesktop {
   private async macKeyPress(keyCombo: string): Promise<void> {
     // A system dialog or the lock screen owning the keyboard refuses here (a bare Escape is never checked).
     await this.guardMacKeys(keyCombo);
-    const { MAC_MODIFIER, runAppleScript, hasNonAscii, refuseNonAsciiChord, typeTextMac } = await import('./mac-keyboard');
+    const { MAC_MODIFIER, runAppleScript, hasNonAscii, pressKeyMac, refuseNonAsciiChord, typeTextMac } = await import('./mac-keyboard');
 
     if (keyCombo === '+') {
       await runAppleScript('tell application "System Events" to keystroke "+"', 5000);
       return;
     }
 
-    const parts = keyCombo.split('+').map(k => k.trim()).filter(Boolean);
+    const parts = splitCombo(keyCombo);
     const key = parts[parts.length - 1] || keyCombo;
     if (!key) {
       throw new Error(`macKeyPress: empty key after parsing combo "${keyCombo}"`);
     }
     // Modifier names → System Events syntax, by the aliases keys.ts knows (mod / cmd / meta = Cmd, opt = Option). An
     // unknown one is refused before anything is pressed: dropped, `opt+x` typed a plain x.
-    const modUsing = parts.slice(0, -1).map(m => {
+    const modNames = parts.slice(0, -1).map(m => {
       const mod = modifierOf(m, 'darwin');
       if (!mod) throw new Error(`Unknown modifier: "${m}"`);
-      return `${MAC_MODIFIER[mod].name} down`;
+      return MAC_MODIFIER[mod].name;
     });
+    const modUsing = modNames.map(n => `${n} down`);
 
     const specialKeys: Record<string, string> = {
       'return': 'key code 36', 'enter': 'key code 36',
@@ -723,6 +742,14 @@ export class NativeDesktop {
       await typeTextMac(defaultMacAx(), key, 5000);
       return;
     }
+    // The helper's CGEvent keys first (never for a modifier key on its own); System Events when it cannot take this key.
+    if (!bareModifier) {
+      const fast = special ? { code: Number(special.slice('key code '.length)) } : key.length === 1 ? { char: key } : null;
+      if (fast) {
+        const { defaultMacAx } = await import('./mac-ax');
+        if (await pressKeyMac(defaultMacAx(), { ...fast, mods: modNames })) return;
+      }
+    }
     if (special) {
       if (modUsing.length > 0) {
         script = `tell application "System Events" to ${special} using {${modUsing.join(', ')}}`;
@@ -741,11 +768,8 @@ export class NativeDesktop {
       throw new Error(`Unknown key: "${key}"`);
     }
 
-    try {
-      await runAppleScript(script, 5000);
-    } catch (err: any) {
-      console.warn(`   ⌨️  macOS key press failed: ${err.message?.substring(0, 100)}`);
-    }
+    // A failed press is an error, as in MacOSAdapter.keyPress: swallowed, smart_type and shortcuts_run reported it done.
+    await runAppleScript(script, 5000);
   }
 
   /**

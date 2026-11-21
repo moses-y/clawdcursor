@@ -169,7 +169,21 @@ function holdsValue(shown: string, want: string): Exclude<ReadBack, 'unknown'> {
 export const EMPTY_AFTER_TYPING = 'read back: the focused field reads empty. The text may not have arrived (the keys went to another element, or a paste came too late), or the app takes keys through a hidden input it empties (a terminal, an online document editor). Read what the screen shows first (compile_ui or ocr); type again only if the text is not there.';
 
 /** What a read of a field gave. `readable`: the read itself worked, so an empty `value` means the field IS empty. */
-export type FieldRead = { value?: string; secure?: boolean; readable?: boolean };
+export type FieldRead = { value?: string; secure?: boolean; readable?: boolean; controlType?: string; name?: string };
+
+/** Role words of a control that takes typed text, on any platform (Edit, Document, ComboBox, AXTextField, a search box…). */
+const TEXT_ENTRY_ROLE = /edit|document|combo|text|entry|search|terminal|input|field|paragraph/i;
+
+/**
+ * Where the focus is when it is NOT a text field, as `Button 'Profile'`; undefined for a text field, or when the read gave no role
+ * (then nothing is known, and nothing is claimed).
+ */
+export function notTextFieldFocus(el: Pick<FieldRead, 'controlType' | 'name'> | undefined): string | undefined {
+  const type = el?.controlType?.trim();
+  if (!type || TEXT_ENTRY_ROLE.test(type)) return undefined;
+  return el?.name?.trim() ? `${type} '${truncateName(el.name.trim())}'` : type;
+}
+const truncateName = (n: string) => (n.length > 40 ? `${n.slice(0, 40)}…` : n);
 
 /**
  * Read the focused field after typing. 'unknown' when it cannot be told — no focused element, a password field (its
@@ -177,6 +191,10 @@ export type FieldRead = { value?: string; secure?: boolean; readable?: boolean }
  * Polls briefly: a field can lag the keys. `value` is what the field showed (for the caller to report). Never throws.
  *
  * `whole`: the field was to be REPLACED, so it must hold the text and nothing else (holdsValue).
+ *
+ * `exact` (typing without a submit): ✓ only when the field's WHOLE value is the typed text (a trailing Tab or line break the
+ * typing sent is ignored). Text that merely CONTAINS what was typed ("2680" after typing "80" onto a field that kept its
+ * "26", live 2026-11-19) is 'suffix', never 'match': the reply then names the whole value, and the agent judges it.
  *
  * An empty read counts only when the reader says the field is `readable` (a by-name value read does, see fieldRead, and
  * so does the focused-element read): then a clear is confirmed, and a field that still shows nothing after typing or a
@@ -187,13 +205,13 @@ export type FieldRead = { value?: string; secure?: boolean; readable?: boolean }
 export async function readBackTyped(
   focused: () => Promise<FieldRead | null | undefined>,
   text: string,
-  opts: { maxMs?: number; stepMs?: number; submit?: boolean; whole?: boolean } = {},
-): Promise<{ result: ReadBack; value?: string; secure?: boolean }> {
-  const { maxMs = 300, stepMs = 100, submit = false, whole = false } = opts;
+  opts: { maxMs?: number; stepMs?: number; submit?: boolean; whole?: boolean; exact?: boolean } = {},
+): Promise<{ result: ReadBack; value?: string; secure?: boolean; elsewhere?: string }> {
+  const { maxMs = 300, stepMs = 100, submit = false, whole = false, exact = false } = opts;
   const want = flat(text);
   if (!want && !whole) return { result: 'unknown' };
   const t0 = Date.now();
-  let last: { result: ReadBack; value?: string } = { result: 'unknown' };
+  let last: { result: ReadBack; value?: string; elsewhere?: string } = { result: 'unknown' };
   for (;;) {
     let el: FieldRead | null | undefined = null;
     try { el = await focused(); } catch { /* unreadable */ }
@@ -204,9 +222,10 @@ export async function readBackTyped(
       // Before a submit the field must END with the text (Return goes to whatever follows it); otherwise anywhere will
       // do — typing into the middle of a document.
       const result = whole ? holdsValue(v, want)
+        : exact && !submit ? (v === want ? 'match' : v.includes(want) ? 'suffix' : 'mismatch')
         : (submit ? v.endsWith(want) : v.includes(want)) ? 'match' : v.includes(want) ? 'suffix' : 'mismatch';
       if (result === 'match') return { result, value: v };
-      last = { result, value: v };
+      last = { result, value: v, elsewhere: notTextFieldFocus(el ?? undefined) };
     }
     if (Date.now() - t0 >= maxMs) return last;
     await new Promise(r => setTimeout(r, stepMs));

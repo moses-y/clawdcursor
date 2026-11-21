@@ -19,8 +19,10 @@ import { controlBanner } from '../core/banner';
 import { osKeysGuide } from '../platform/keys';
 import { enableHostAncestry } from '../core/ai-hosts';
 import { actedIn, actRecord, withTurnBudget } from '../core/control';
+import { asPauseOwner, pauseGate } from '../core/pause-gate';
 import { logger } from '../core/observability/logger';
 import { COMPOUND_ROUTE_INDEX, compactCall } from '../tools/compact-routes';
+import { resultCallsAsProse } from '../tools/call-prose';
 
 const COMPOUND_TOOLS = new Set(Object.keys(COMPOUND_ROUTE_INDEX));
 /** A compound call's arguments that its schema does not list (keepUndeclaredArgs), for the call being run. */
@@ -30,7 +32,9 @@ import { SessionLog, outcomeOf } from './session-log';
 import { withSteps, watchChildProcesses } from '../core/observability/steps';
 import { inMcpSession } from '../core/verify/assertions';
 import { allowNames, setHost } from '../core/observability/telemetry';
+import { setGuideSurface } from '../core/guides/hint';
 import { classifyResult, renderResultLine, isJsonText, isActingAction, isUnverifiableAction } from '../core/result-codes';
+import { quoteScreenText } from '../core/untrusted-screen-content';
 import { refusalBefore, afterCall, forgetScreenIfActed, guardedCall } from '../tools/call-guards';
 import { OPAQUE_MARK } from '../tools/blind-hints';
 import { bareStepName } from '../tools/batch';
@@ -128,6 +132,8 @@ export function batchActs(steps: unknown): boolean {
  * The caller is responsible for connecting a transport via `server.connect(...)`.
  * Use `startMcpStdio` for editor integrations and `startMcpHttp` for the daemon.
  */
+let sessionSeq = 0;
+
 export async function createMcpServer(options: CreateMcpServerOptions): Promise<McpServerHandle> {
   const { compact, ctx } = options;
   // Dynamic import: the SDK is ESM and our build is CJS. The specifier cast is
@@ -144,6 +150,8 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
   // integrating agent (Claude Code, Cursor, Windsurf, Zed, OpenClaw) HOW to
   // use clawdcursor cheaply. Without it, agents drive the raw GUI tools with
   // their own premium model, the expensive path.
+  // The one tool that asks the user, named the way this surface names it (compact: a compound tool and its action).
+  const pauseTool = compact ? 'the system tool, action pause_for_user' : 'the pause_for_user tool';
   const instructions =
       // Owner 2026-11-17: the agent should know, without being told to use clawdcursor, that no task asked of it is out of
       // reach (the 0.5-era rules a 2026-02 skill scan cut and the 2.x "FALLBACK layer" line replaced).
@@ -151,6 +159,9 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
       'on a screen, you can. Use it on your own whenever a request needs an app, a window, a website or anything on the screen; ' +
       'the user does not have to name it. Do not tell the user you cannot reach their desktop or an app, and do not ask them to do ' +
       'a step you can do with these tools. You drive the tools yourself. ' +
+      // Live runs (audit 2026-11-19, and the 2026-11-19 terminal runs): the first call often went to a bare `window`, which
+      // the host does not have, because it lists the tools with its own prefix.
+      'The tool names in this text are short: call each tool by the full name your host lists for it (hosts add a prefix). ' +
       (compact
         // Compact tools carry no per-tool cost prefix, so name the actions.
         ? 'TO SEE: (1) accessibility read_tree lists the window\'s elements by name; ' +
@@ -172,7 +183,7 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
       'is where a screenshot is the right tool, inside that area only: plan every stroke from one screenshot, send them in ONE batch ' +
       '(click with path, drag_path), then check with ONE screenshot_region of only the changed area, max_edge 512. ' +
       'The toolbars, fields and dialogs around it are still pressed by name (invoke) or by visible label (smart_click), not by pixel. ' +
-      'Roadblocks only the user can clear (sign-in, 2FA, CAPTCHA, a step that needs their confirmation): call system {action:"pause_for_user", message} — ' +
+      `Roadblocks only the user can clear (sign-in, 2FA, CAPTCHA, a step that needs their confirmation): call ${pauseTool} with a message — ` +
       'ask for that ONE step only ("Sign in to Glama") and do everything before and after it yourself; for a sign-in, code or CAPTCHA, done_when ' +
       '(what shows on screen once they are done) ends the pause the moment they finish, with no Resume click — never for a confirmation or a choice. Never type or guess credentials. ' +
       'A step your own rules won\'t let you take (creating an account, downloading a private key, entering a password, key or token) is a roadblock too, ' +
@@ -180,17 +191,21 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
       'and ask only for the paste ("Paste your app-specific password into the Terminal, press Enter, then click Resume"), naming where it goes: never into the prompt\'s own reply box, whose text reaches you; afterwards pass the saved key\'s file path or keychain profile name, never the secret. A plan limit or upgrade wall is a roadblock too: ' +
       'stop, quote the blocking text and pause_for_user; never click Upgrade / Subscribe yourself. ' +
       'While you are driving the desktop, the user is watching the screen, not your chat: ask them on the pause card (use choices when there are options), not in your own chat — ' +
-      'system {action:"pause_for_user", message, choices:[...], input:{placeholder?, multiline?}}. Before an irreversible action the user did not ask for (sending, deleting, paying, closing unsaved work), ask there first and follow the answer {status:"replied", choice | reply}: clawdcursor does not judge what you do, so that decision is yours. ' +
+      `${pauseTool} with message, choices (a list, when there are options) and input (placeholder, multiline). Before an irreversible action the user did not ask for (sending, deleting, paying, closing unsaved work), ask there first and follow the answer {status:"replied", choice | reply}: clawdcursor does not judge what you do, so that decision is yours. ` +
       'Drive UI symbolically: compile_ui / find_button / find_field return a stable ' +
       '{element_id, snapshot_id} you pass to invoke/set_value — it survives layout shifts, so ' +
-      'prefer it over pixel coordinates. Pass `expect` on consequential actions so a failed one ' +
+      'prefer it over pixel coordinates. ' +
+      `When a result shows keys from a guide, press them instead of hunting with the mouse; the rest of that guide is ${compact ? 'the system tool, action shortcuts_list' : 'the shortcuts_list tool'}, with context. ` +
+      'Pass `expect` on consequential actions so a failed one ' +
       'reports a DEVIATION instead of a hollow success. Each action result and error ends with one line: ' +
       '[confirmed | unverified | refused · CODE · hint · next | failed · CODE · hint · next] — follow its next call instead of guessing. ' +
+      'PAUSED (the user paused clawdcursor) means nothing was sent: call the same step again until it runs, and do not give up or act another way meanwhile. USER_ACTIVE (the user is using the computer, which they may while you work in the background) means nothing was sent: keep working by name meanwhile, and call that step again in a few seconds. A STOPPED reply is different: do not retry it. ' +
       'A native API, CLI or direct file edit that does the same job is cheaper: use it when it exists, and never decline a task ' +
       'because none does. Full usage guide: the `clawdcursor` skill registered in your agent, or ' +
       'https://clawdcursor.com/llms.txt.';
 
   const server = new McpServer({ name: 'clawdcursor', version: VERSION }, { instructions });
+  setGuideSurface(compact);   // the app-guide hint names the tool as this surface spells it
 
   // Local record of this session (tool / action / blind-vs-vision / ok — no
   // content). Feeds `clawdcursor report` and the vision-streak nudge below.
@@ -206,7 +221,7 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
   // A CAD run (2026-11-16) made 73 coordinate clicks, ~58 on labelled buttons, and 7 accessibility calls: after 3 coordinate clicks with no
   // click by name since, say once that a label is pressed by name. A batch is act-other and is not counted.
   const COORD_CLICK_HINT = compact
-    ? '[clawdcursor] 3 clicks by coordinates and none by name. A button, tab, menu or field with a visible label: accessibility smart_click {"target":"<label>"} presses it with no screenshot; keep x,y for points with no label, like inside a canvas.'
+    ? '[clawdcursor] 3 clicks by coordinates and none by name. A button, tab, menu or field with a visible label: smart_click {"target":"<label>"} presses it with no screenshot; keep x,y for points with no label, like inside a canvas.'
     : '[clawdcursor] 3 clicks by coordinates and none by name. A button, tab, menu or field with a visible label: smart_click {"target":"<label>"} presses it with no screenshot; keep x,y for points with no label, like inside a canvas.';
   let coordClicks = 0;
   let coordNudged = false;
@@ -264,6 +279,14 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
   let sessionStartedAt: number | undefined;
   const lowLevel = (server as unknown as { server?: { oninitialized?: () => void } }).server;
   if (lowLevel) lowLevel.oninitialized = () => { sessionStartedAt = Date.now(); setHost(clientInfo()?.name); };
+  // This session's pause card comes down when the session ends (stdio closing, an HTTP session closed): nobody is left to read
+  // the answer, and the card would keep every other agent out. A process exit takes its own overlay down (banner.ts).
+  const sessionId = `mcp-${process.pid}-${++sessionSeq}`;
+  const lowClose = server as unknown as { server?: { onclose?: () => void } };
+  if (lowClose.server) {
+    const prior = lowClose.server.onclose;
+    lowClose.server.onclose = () => { prior?.(); pauseGate.withdrawFor(sessionId); };
+  }
 
   for (const tool of tools) {
     // Convert parameter defs to a Zod schema map. The MCP SDK uses zod
@@ -292,10 +315,13 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
         // hint and a safe next call (result-codes.ts). Not on JSON results (they carry their own status) or a batch
         // (its report has a status per step).
         const callAction = typeof params?.action === 'string' ? params.action : undefined;
+        // Every call a hint names goes out as prose for this surface ("the browser tool, action page_context"), never as a
+        // call-shaped text the host has no tool of that name for (call-prose.ts).
+        const surface = compact ? 'compact' : 'granular';
         const withOutcome = (text: string, isError: boolean): string => {
-          if (tool.name === 'batch' || isJsonText(text)) return text;
+          if (tool.name === 'batch' || isJsonText(text)) return resultCallsAsProse(text, surface);
           const c = classifyResult(text, isError, isActingCall(tool.name, callAction, isUnverifiableAction), 'mcp', isActingCall(tool.name, callAction));
-          return c ? `${text}\n${renderResultLine(c)}` : text;
+          return resultCallsAsProse(c ? `${text}\n${renderResultLine(c)}` : text, surface);
         };
         // Consent gate (non-fatal): until the user accepts one-time consent,
         // every tool returns a clear, host-VISIBLE prompt instead of the server
@@ -347,7 +373,7 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
         const releasePill = controlBanner.hold();  // the call has control until it returns, waits included
         sessionLog.running(tool.name, action, clientInfo());
         // withTurnBudget: the call's waits for the user (control.ts) end before a host's 60 s call limit.
-        const run = await withSteps(tool.name, action, () => inMcpSession(sessionStartedAt ?? started, () => withTurnBudget(() => tool.handler(params, ctx))));  // where the call's time went
+        const run = await withSteps(tool.name, action, () => inMcpSession(sessionStartedAt ?? started, () => withTurnBudget(() => asPauseOwner(sessionId, () => tool.handler(params, ctx)))));  // where the call's time went
         releasePill();
         if (!run.ok) {
           // A handler throw (e.g. projected tools' toolContextToAgent when the
@@ -384,6 +410,7 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
         // A missed find, an empty clipboard or a timeout says nothing about the window. Only the tool's own words count,
         // never the screen text inside the block.
         if (sessionLog.summary.blind > blindBefore) {
+          nudgedThisStreak = false;   // a blind read ends the run of screenshots; clicks between screenshots do not
           const own = (result.text ?? '').split('</untrusted-screen-content>').pop()!;
           blindFoundNothing = cls === 'blind' && (own.startsWith('(empty a11y tree') || own.includes(OPAQUE_MARK));
         }
@@ -394,7 +421,6 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
         // 5th was noise). Where the last blind read found nothing (a canvas),
         // say instead how to use screenshots well there (#356).
         const streak = sessionLog.visionOnlyStreak;
-        if (streak <= 1) nudgedThisStreak = false;
         // The first screenshot of a session that has read nothing yet is the cheapest moment to say it.
         const firstBlind = streak === 1 && sessionLog.summary.blind === 0;
         if (cls === 'vision' && !result.isError && !nudgedThisStreak && (blindFoundNothing || firstBlind || streak >= 3)) {
@@ -412,6 +438,10 @@ export async function createMcpServer(options: CreateMcpServerOptions): Promise<
           content.push({ type: 'image', data: result.image.data, mimeType: result.image.mimeType });
         }
         content.push({ type: 'text', text: withOutcome(result.text, !!result.isError) });
+        // What the agent's browser downloaded since the last call, now in the user's Downloads folder (cdp-driver.ts). A
+        // block of its own: a JSON or value result stays exactly as it was.
+        const saved: string[] = (ctx.cdp as { takeSavedDownloads?: () => string[] } | undefined)?.takeSavedDownloads?.() ?? [];
+        if (saved.length) content.push({ type: 'text', text: `Downloaded to: ${saved.map(quoteScreenText).join(', ')}` });
         return { content, isError: result.isError };
       },
     );

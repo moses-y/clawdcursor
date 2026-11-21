@@ -203,13 +203,13 @@ function compactNameIndex(): Map<string, Array<{ compound: string; action: strin
  * Rewrite granular tool names in free text to the compact spelling, in the one call notation the result line uses
  * (`cdp_connect` → `browser {"action":"connect"}`). Arguments written after the name join the same braces
  * (`smart_click {"target":"Save"}` → `accessibility {"action":"smart_click","target":"Save"}`). Only multi-word names are
- * touched so plain English (`wait`) is never rewritten; a name already inside `{"action":"…"}` is left alone.
+ * touched so plain English (`wait`) is never rewritten; a name already inside `{"action":"…"}`, or written as prose "action <name>", is left alone.
  */
 export function toCompactNames(text: string, preferCompound: string): string {
   const index = compactNameIndex();
   const names = [...index.keys()].filter(n => n.includes('_')).sort((a, b) => b.length - a.length);
   if (!names.length) return text;
-  return text.replace(new RegExp(`(?<!"action"\\s*:\\s*")\\b(${names.join('|')})\\b(?:\\s*\\{(\\s*"[^{}]*|\\s*)\\})?`, 'g'), (_m, name: string, args?: string) => {
+  return text.replace(new RegExp(`(?<!"action"\\s*:\\s*"|\\baction )\\b(${names.join('|')})\\b(?:\\s*\\{(\\s*"[^{}]*|\\s*)\\})?`, 'g'), (_m, name: string, args?: string) => {
     const routes = index.get(name)!;
     const r = routes.find(x => x.compound === preferCompound) ?? routes[0];
     return `${r.compound} {"action":"${r.action}"${args?.trim() ? `,${args.trim()}` : ''}}`;
@@ -285,10 +285,16 @@ async function dispatchCompound(
     return { text: `${compoundName}: delegate "${route.delegate}" not registered`, isError: true };
   }
 
-  const forwarded: Record<string, unknown> = {};
+  // Computer-use sends a point as `coordinate:[x,y]` (#410): x and y for a pointer action, unless they are given.
+  const point = Array.isArray(args.coordinate) && args.coordinate.length === 2 && args.coordinate.every(n => typeof n === 'number')
+    && 'x' in granular.parameters && 'y' in granular.parameters && args.x === undefined && args.y === undefined
+    ? { x: args.coordinate[0], y: args.coordinate[1] } : {};
+
+  const forwarded: Record<string, unknown> = { ...point };
   for (const [k, v] of Object.entries(args)) {
     // `shot` is checked by the MCP wrapper / batch (screen-guard.ts), not by the granular tool.
     if (k === 'action' || k === 'shot') continue;
+    if (k === 'coordinate' && 'x' in point) continue;
     const mapped = route.argRemap?.[k] ?? k;
     // An alias never overrides the real name given in the same call.
     if (mapped !== k && args[mapped] !== undefined) continue;
@@ -440,6 +446,7 @@ export function getCompactTools(): ToolDefinition[] {
         timeout: 'pause_for_user: max seconds to wait for the user before returning {status:"waiting"} (default 45, clamped 1–50); the prompt stays up, re-call with the same message.',
         text: 'clipboard_write: the text to put on the clipboard (it overwrites the user\'s clipboard).',
         processId: 'ocr: read only this process\'s window, drawn by itself: even where other windows cover it, and without focusing it (Windows, macOS).',
+        query: 'shortcuts_list: only the shortcuts whose name or keys contain these words (e.g. "bold", "next tab"). build_uri: a JSON object of query parameters, e.g. {"subject":"hi","body":"hello"}; each value is URL-encoded.',
       }),
       category: 'orchestration',
       safetyTier: 1,
@@ -451,7 +458,7 @@ export function getCompactTools(): ToolDefinition[] {
       name: 'window',
       description:
         'Windows, apps and displays at the OS level. For what is INSIDE a window use `accessibility`; for a web page\'s DOM `browser`. ' +
-        'Read: `list` (every visible window: title, process, pid, bounds), `active` (the focused window), `list_displays` (monitors, bounds, DPI), `screen_size`. ' +
+        'Read: `list` (every open app: process, pid, window count; titles and bounds only for windows clawdcursor opened or worked in), `active` (the focused window), `list_displays` (monitors, bounds, DPI), `screen_size`. ' +
         'Arrange (target with processName, processId or a title substring; none = the foreground window): `focus`, `maximize`, `minimize`, `restore`, `resize` (x, y, width, height). ' +
         '`close` asks the app to close, like its ✕: unsaved work can be lost, so ask the user first unless they asked for it. ' +
         'Open: `open_app` (name; launches or focuses), `open_file` (path, default app; an .exe/.app is executed), `open_url` (url, default browser), `navigate` (url, in clawdcursor\'s own browser), `switch_tab` (index 1–9, or direction). ' +

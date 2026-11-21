@@ -9,14 +9,14 @@
 import pc from 'picocolors';
 import { NativeDesktop } from '../platform/native-desktop';
 import { AccessibilityBridge } from '../platform/accessibility';
-import { macAxStatus } from '../platform/mac-ax';
+import { macAxStatus, prebuildMacAxHelper } from '../platform/mac-ax';
 import { DEFAULT_CONFIG } from '../types';
 import { getPackageRoot } from '../paths';
 import { hasConsent } from './onboarding';
 import { checkPermissionsQuick, requestPermissions, screenRecordingGranted, nativeBuildHint, isMacOS } from '../platform/native-helper';
-import { findInstalledCopies, describeCopies, compareVersions, fetchLatestRelease } from './installed-copies';
+import { findInstalledCopies, describeCopies, compareVersions } from './installed-copies';
 import { VERSION } from '../version';
-import { installMethod, howToUpdate } from './update';
+import { installMethod, howToUpdate, latestPublished } from './update';
 
 interface DiagResult {
   name: string;
@@ -140,6 +140,7 @@ export async function runDoctor(): Promise<void> {
 
       // The fast accessibility helper (window list / trees in tens of ms). Missing Command Line Tools is not a
       // failure — the osascript path still works — but it is slower, and the fix is one command.
+      await prebuildMacAxHelper();   // build it now rather than at the first call; a failure only leaves the status below as it was
       const helper = await macAxStatus();
       results.push({ name: 'macOS accessibility helper', ok: true, detail: helper.detail });
       console.log(`   ${helper.state === 'no-devtools' ? '⚠️ ' : '✅'} Accessibility helper: ${helper.detail}`);
@@ -193,7 +194,7 @@ function printSummary(results: DiagResult[]): void {
     console.log(`   Next:`);
     console.log(`     ${pc.cyan('clawdcursor agent')}           run it, with a live log of every action on this computer`);
     console.log(`     ${pc.cyan('clawdcursor task "<task>"')}   test an agent (with ${pc.cyan('clawdcursor agent')} open, its actions show in the live log)\n`);
-    console.log(pc.gray(`   Editors (Claude Code, Cursor, Windsurf, Zed) run their own clawdcursor: register \`clawdcursor mcp\` in the editor's MCP config.`));
+    console.log(pc.gray(`   Editors (Claude Code, Cursor, Windsurf, Zed) run their own clawdcursor: register \`clawdcursor mcp --compact\` in the editor's MCP config.`));
   } else {
     const failures = results.filter(r => !r.ok);
     console.log(`⚠️  ${failures.length} issue(s) detected:`);
@@ -239,43 +240,33 @@ function checkInstalledCopies(results: DiagResult[], latest: string | undefined)
 }
 
 /**
- * Check for newer versions on GitHub releases. Returns the latest released
+ * Check for newer versions on the npm registry, as `clawdcursor update` does. Returns the latest published
  * version when the check succeeded.
  */
-async function checkForUpdates(results: DiagResult[]): Promise<string | undefined> {
+export async function checkForUpdates(results: DiagResult[]): Promise<string | undefined> {
   try {
     const currentVersion = VERSION;
     console.log(`   Current: v${currentVersion}`);
 
-    // The same release `versions` flags copies against (installed-copies.ts latestRelease).
-    const res = await fetchLatestRelease();
+    const latestTag = await latestPublished();
 
-    if (res.ok) {
-      const data = await res.json() as any;
-      const latestTag = (data.tag_name || '').replace(/^v/, '');
-
-      if (latestTag && latestTag !== currentVersion && compareVersions(latestTag, currentVersion) > 0) {
-        console.log(`   ⬆️  Update available: v${latestTag} (you have v${currentVersion})`);
-        const method = installMethod(getPackageRoot());
-        console.log(`   ${method === 'npm-global' ? 'Run: clawdcursor update' : howToUpdate(method)}`);
-        results.push({
-          name: 'Version',
-          ok: false,
-          detail: `Update available: v${latestTag} (current: v${currentVersion})`,
-        });
-      } else {
-        console.log(`   ✅ Up to date (v${currentVersion})`);
-        results.push({ name: 'Version', ok: true, detail: `v${currentVersion} (latest)` });
-      }
-      return latestTag || undefined;
+    if (compareVersions(latestTag, currentVersion) > 0) {
+      console.log(`   ⬆️  Update available: v${latestTag} (you have v${currentVersion})`);
+      const method = installMethod(getPackageRoot());
+      console.log(`   ${method === 'npm-global' ? 'Run: clawdcursor update' : howToUpdate(method)}`);
+      results.push({
+        name: 'Version',
+        ok: false,
+        detail: `Update available: v${latestTag} (current: v${currentVersion})`,
+      });
     } else {
-      // GitHub API rate limit or error — skip gracefully
-      console.log(`   ✅ v${currentVersion} (update check skipped — GitHub API returned ${res.status})`);
-      results.push({ name: 'Version', ok: true, detail: `v${currentVersion} (update check skipped)` });
+      console.log(`   ✅ Up to date (v${currentVersion})`);
+      results.push({ name: 'Version', ok: true, detail: `v${currentVersion} (latest)` });
     }
+    return latestTag;
   } catch (err: any) {
-    if (err.name === 'AbortError') {
-      console.log(`   ⚠️  Update check timed out (5s) — skipping`);
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      console.log(`   ⚠️  Update check timed out (10s) — skipping`);
     } else {
       console.log(`   ⚠️  Update check failed — skipping`);
     }

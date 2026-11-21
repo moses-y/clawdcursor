@@ -17,6 +17,7 @@ import { imageScale, scaleCoord, screenCenter, mapImagePoint, mapImageLength } f
 import type { InvokeAction, UiElement } from '../../platform/types';
 import { ocrEngine } from '../../platform/ocr-engine';
 import { selectOption, selectedResult } from '../../platform/select-option';
+import { comboSequence } from '../../platform/keys';
 import { ownsPoint } from '../click-owner';
 import { SCREEN_COORDS_NOTE, shownValue, shownHelp, opaqueArea, opaqueAreaLine, drawnControlsLine, SPARSE_NEXT_STEP, isSparseTree, CUT_VALUE_NEXT_STEP, cdpStepFor, cdpBrowserPid } from '../blind-hints';
 import { getUiTreeWithWake } from '../../platform/a11y-wake';
@@ -33,7 +34,7 @@ import { findActionButton, findInputField, type FindResult } from '../../core/se
 import { inferCapabilities } from '../../core/sense/ui-map-normalize';
 import type { UIMap, UIElement } from '../../core/sense/ui-map-types';
 import { pasteChoice, CLIPBOARD_HELD_REFUSAL, waitForPaste, writeClipboardVerified, readBackTyped, setResult, setVerdict, fieldRead, typesAsKeys, EMPTY_AFTER_TYPING, selectAllScope, type Retyped } from '../paste-guard';
-import { sleepUnlessStopped, STOPPED_TEXT } from '../../core/control';
+import { sleepUnlessStopped, STOPPED_TEXT, isAgentWindow } from '../../core/control';
 import { timeWait } from '../../core/observability/steps';
 import { unguarded } from '../../platform/pointer-guard';
 import { preferControl, notSelectableReason, failReason, sameElement, inside } from '../../platform/prefer-control';
@@ -41,6 +42,7 @@ import { viaLadder } from '../../platform/ladder';
 import { effectLine, windowChange, type WindowRead } from '../../core/effect';
 import { missText, structuredMissFields, untrusted, targetOf, targetText } from '../../core/miss-text';
 import { sleep } from '../../sleep';
+import { withGuideHint } from '../../core/guides/hint';
 
 /** a11y_get_value returns a value whole up to this size (a long document, not a whole book). */
 const GET_VALUE_MAX = 20_000;
@@ -177,19 +179,56 @@ export function buildUnifiedTools(): UnifiedTool[] {
 
     {
       name: 'list_windows',
-      description: 'List visible top-level windows with title, process, and bounds. Useful when the active window is wrong or missing.',
-      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      description: 'List the open apps (process name, pid, and how many windows each has), and the title, process and bounds of the windows clawdcursor itself opened or worked in. The titles of other windows are not listed: a document title can hold private text. To see one app\'s window titles (to focus or close the right one), pass processName or processId: that app\'s windows are then listed in full.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          processName: { type: 'string', description: 'List only this app\'s windows, with titles (name contains this, any case)' },
+          processId: { type: 'number', description: 'List only this process\'s windows, with titles' },
+        },
+        additionalProperties: false,
+      },
       changesScreen: false,
-      async execute(_args, ctx) {
-        const windows = await ctx.platform.listWindows();
+      async execute(args, ctx) {
+        const all = await ctx.platform.listWindows();
         const active = await ctx.platform.getActiveWindow();
-        const lines = windows.slice(0, 20).map(w => {
+        const wantName = typeof args.processName === 'string' ? args.processName.trim().toLowerCase() : '';
+        const wantPid = typeof args.processId === 'number' ? args.processId : undefined;
+        const filtered = !!wantName || wantPid !== undefined;
+        const windows = filtered
+          ? all.filter(w => (wantPid === undefined || w.processId === wantPid)
+            && (!wantName || String(w.processName ?? '').toLowerCase().includes(wantName)))
+          : all;
+        const line = (w: (typeof all)[number]) => {
           const isActive = active && w.processId === active.processId && w.title === active.title;
           return `${isActive ? '→' : ' '} [${quoteScreenText(String(w.processName ?? ''))}] ${quoteScreenText(String(w.title ?? ''))} pid=${w.processId} ${w.bounds.width}×${w.bounds.height}`;
-        });
-        const more = windows.length > 20 ? `\n… +${windows.length - 20} more windows` : '';
+        };
         const partial = ctx.platform.lastWindowListPartial ? `\n${ctx.platform.lastWindowListPartial}` : '';
-        return { success: true, text: `Windows (${windows.length}):\n${lines.join('\n')}${more}${partial}` };
+        if (filtered) {
+          const shown = windows.slice(0, 20).map(line);
+          const more = windows.length > 20 ? `\n… +${windows.length - 20} more windows` : '';
+          return { success: true, text: `Windows of that app (${windows.length}):\n${shown.join('\n')}${more}${partial}` };
+        }
+        // Titles of windows the user has open are theirs: one list put an unrelated document's name, with a
+        // credential-like string in it, into the model's context. Only the agent's own windows show a title,
+        // and an app's titles come on request (processName or processId).
+        const mine = windows.filter(w => isAgentWindow({ handle: w.handle, processId: w.processId }));
+        const apps = new Map<number, { name: string; count: number; active: boolean }>();
+        for (const w of windows) {
+          if (mine.includes(w)) continue;
+          const isActive = !!active && w.processId === active.processId && w.title === active.title;
+          const a = apps.get(w.processId) ?? { name: String(w.processName ?? ''), count: 0, active: false };
+          a.count++;
+          a.active ||= isActive;
+          apps.set(w.processId, a);
+        }
+        const lines = [
+          ...mine.map(line),
+          ...[...apps].map(([pid, a]) => `${a.active ? '→' : ' '} [${quoteScreenText(a.name)}] pid=${pid}${a.count > 1 ? ` (${a.count} windows)` : ''}`),
+        ];
+        const shown = lines.slice(0, 20);
+        const more = lines.length > 20 ? `\n… +${lines.length - 20} more` : '';
+        return { success: true, text: `Windows (${windows.length}; titles: pass processName or processId):\n${shown.join('\n')}${more}${partial}` };
       },
     },
 
@@ -254,9 +293,8 @@ export function buildUnifiedTools(): UnifiedTool[] {
             return { success: true, text: `Clicked ${plan.element.id} at its bounds center${plan.offView ? ' (scrolled into view first)' : ''}.`, targetLabel: plan.element.id };
           }
         }
-        // `automationId` is accepted for MCP backward-compat but the PlatformAdapter
-        // invokeElement interface does not expose automationId filtering — it is used
-        // only as a name alias when name is absent.
+        // `automationId` goes to the adapter as an id (Windows UIA AutomationId, macOS AXIdentifier), never as a name: an id
+        // looked up as a name always misses. `name` below is only what the reply calls the element.
         const rawName = typeof args.name === 'string' ? args.name : '';
         const automationId = typeof args.automationId === 'string' ? args.automationId : undefined;
         const name = rawName || automationId || '';
@@ -286,7 +324,7 @@ export function buildUnifiedTools(): UnifiedTool[] {
         // strict — the agent that asked to expand never silently gets a select.
         // Pure adapter-string retries → works on every OS with zero per-OS code,
         // and only the failing path pays the extra round-trips.
-        const page = action === 'click' ? await cdpOf(ctx, processId) : null;   // see set_field_value
+        const page = action === 'click' && rawName ? await cdpOf(ctx, processId) : null;   // see set_field_value
         if (page && (await page.clickByText(name).catch(() => null))?.success) {
           ctx.platform.noteRoute?.(CDP_ROUTE);
           return { success: true, text: `Invoked ${quoteScreenText(name)} via the page (browser).`, targetLabel: name };
@@ -294,7 +332,7 @@ export function buildUnifiedTools(): UnifiedTool[] {
         const ladder: InvokeAction[] = action === 'click' ? ['click', 'select', 'toggle'] : [action];
         await wakeForNameSearch(ctx.platform, processId);
         const { res, used } = await runActivationLadder(
-          (a) => ctx.platform.invokeElement({ name, controlType, processId, action: a, value, within }), ladder);
+          (a) => ctx.platform.invokeElement({ ...(rawName ? { name: rawName } : {}), ...(automationId ? { automationId } : {}), controlType, processId, action: a, value, within }), ladder);
         // Found but no pattern took: click the surfaced bounds centre (same
         // fallback the el_NN path and smart_click already have). Live
         // regression 2026-10: `find` saw the Button, invoke reported "missed".
@@ -690,8 +728,8 @@ export function buildUnifiedTools(): UnifiedTool[] {
             items: { type: 'object', properties: { x: { type: 'number' }, y: { type: 'number' } }, required: ['x', 'y'] },
           },
           interval_ms: { type: 'number', description: 'With path: milliseconds between clicks (default 100, max 5000).' },
-          button: { type: 'string', enum: ['left', 'right'] },
-          count: { type: 'number', description: '1=single, 2=double' },
+          button: { type: 'string', enum: ['left', 'right', 'middle'] },
+          count: { type: 'number', description: '1=single (default), 2=double, 3=triple' },
           space: COORD_SPACE_SCHEMA,
           expect: EXPECT_SCHEMA,
         },
@@ -699,13 +737,14 @@ export function buildUnifiedTools(): UnifiedTool[] {
       },
       changesScreen: true,
       async execute(args, ctx) {
+        const how = clickHow(args);
+        if ('error' in how) return { success: false, isError: true, text: how.error };
         if (args.path !== undefined && args.path !== null) return clickPath(args, ctx);
         const { x: ix, y: iy, warning } = coerceCoord(args.x, args.y);
         if (!Number.isFinite(ix) || !Number.isFinite(iy)) {
           return { success: false, isError: true, text: `click: x/y must be finite numbers, got x=${JSON.stringify(args.x)} y=${JSON.stringify(args.y)}` };
         }
-        const button = args.button === 'right' ? 'right' : 'left';
-        const count = args.count === 2 ? 2 : 1;
+        const { button, count } = how;
         const space = pointerSpace(args);
         const scale = space === 'image' ? imageScale(ctx) : 1;
         // Image coords go through the last frame (any monitor); screen coords pass through.
@@ -898,7 +937,7 @@ export function buildUnifiedTools(): UnifiedTool[] {
           }
         }
         // Read the field back: say whether it shows the text — before Return.
-        const rb = body ? await readBackTyped(() => ctx.platform.getFocusedElement(), body, { submit }) : { result: 'unknown' as const };
+        const rb = body ? await readBackTyped(() => ctx.platform.getFocusedElement(), body, { submit, exact: true }) : { result: 'unknown' as const };
         // The verdict sits inside the leading "(…)", before any quoted text or window title, so content can never pose as
         // it (result-codes reads it from there).
         // Characters as a person counts them (an emoji is one), not UTF-16 units.
@@ -913,16 +952,23 @@ export function buildUnifiedTools(): UnifiedTool[] {
         if (!empty && (rb.result === 'suffix' || rb.result === 'mismatch') && submit) {
           // Return would submit what the field shows, not what was typed (live: an address bar's suggestion swapped the
           // whole URL). Not pressed; the caller sees what the field shows and decides.
+          // The focus is not on a text field at all (a profile picker, a button): the page's text is not a suggestion.
+          const elsewhere = rb.elsewhere;
           const what = rb.result === 'suffix'
             ? 'the typed text with more after it (an autocomplete suggestion: Delete drops it)'
             : 'different text (a suggestion took over, or the field reformatted it)';
           return {
             success: false,
-            text: `${shown}, but the field shows ${what} — Return not pressed. Check the field: if it is right, press Return; otherwise fix it first.${fieldShows}${inputWarningNote(ctx)}`,
+            text: `${shown}, but ${elsewhere ? `the focus is on ${elsewhere}, not a text field` : `the field shows ${what}`} — Return not pressed. ${elsewhere ? 'Click the field you meant, then type again.' : 'Check the field: if it is right, press Return; otherwise fix it first.'}${fieldShows}${inputWarningNote(ctx)}`,
           };
         }
         if (submit) await ctx.platform.keyPress('Return');
-        const note = empty ? ` ⚠ ${EMPTY_AFTER_TYPING}` : rb.result === 'suffix' || rb.result === 'mismatch'
+        const note = empty ? ` ⚠ ${EMPTY_AFTER_TYPING}`
+          : (rb.result === 'suffix' || rb.result === 'mismatch') && rb.elsewhere
+          ? ` ⚠ read back: the focus is on ${rb.elsewhere}, not a text field; check it before going on.${fieldShows}`
+          : rb.result === 'suffix' && rb.value !== undefined
+          ? ` ⚠ read back: the field now holds ${wrapUntrustedScreenContent(truncate(rb.value, 80))} (not only what was typed). If it should hold only this, select the whole field and type again.`
+          : rb.result === 'suffix' || rb.result === 'mismatch'
           ? ` ⚠ read back: the field shows different text (an autocomplete suggestion, or the field reformatted it); check it before going on.${fieldShows}`
           : '';
         return { success: true, text: `${shown}${note}${inputWarningNote(ctx)}` };
@@ -967,8 +1013,8 @@ export function buildUnifiedTools(): UnifiedTool[] {
           return { success: false, isError: true, text: 'key: "repeat" must be a whole number from 1 to 100.' };
         }
         const input = raw.trim();
-        // "+" joins a chord; whitespace separates combos pressed in sequence.
-        const combos = input.split(/\s+/);
+        // "+" joins a chord (spaces around it are part of it: "ctrl + s" is ctrl+s); whitespace separates combos pressed in sequence.
+        const combos = comboSequence(input);
         // The hard key list (lock / log out / secure attention) is refused in the input layer, for every
         // caller: platform/hard-keys.ts, called from guardInputMethods.
         ctx.platform.takeInputWarning?.();      // a warning left by some earlier keystrokes is not this call's
@@ -1001,7 +1047,11 @@ export function buildUnifiedTools(): UnifiedTool[] {
         const q = buildWinQuery(args) ?? {};
         const ok = await ctx.platform.focusWindow(q);
         await sleep(250);
-        return { success: ok, text: ok ? 'Focused matching window.' : ctx.platform.takeFocusFailure?.() ?? 'No matching window found.' };
+        // The reply names the window it focused, or says why none (no match, or the several that matched).
+        const note = ctx.platform.takeWindowNote?.() ?? null;
+        if (!ok) return { success: ok, text: ctx.platform.takeFocusFailure?.() ?? 'No matching window found.' };
+        const w = await Promise.resolve(ctx.platform.getActiveWindow?.()).catch(() => null);
+        return { success: ok, text: withGuideHint(note ?? 'Focused matching window.', { names: [w?.processName ?? '', String(args.processName ?? '')], title: w?.title }) };
       },
     },
 
@@ -1022,7 +1072,8 @@ export function buildUnifiedTools(): UnifiedTool[] {
       async execute(args, ctx) {
         const q = buildWinQuery(args);
         const ok = await ctx.platform.setWindowState('maximize', q);
-        return { success: ok, text: ok ? 'Maximized window.' : 'Maximize request ignored.' };
+        const note = ctx.platform.takeWindowNote?.();
+        return { success: ok, text: note ?? (ok ? 'Maximized window.' : 'Maximize request ignored.') };
       },
     },
 
@@ -1042,7 +1093,8 @@ export function buildUnifiedTools(): UnifiedTool[] {
       async execute(args, ctx) {
         const q = buildWinQuery(args);
         const ok = await ctx.platform.setWindowState('minimize', q);
-        return { success: ok, text: ok ? 'Minimized window.' : 'Minimize request failed.' };
+        const note = ctx.platform.takeWindowNote?.();
+        return { success: ok, text: note ?? (ok ? 'Minimized window.' : 'Minimize request failed.') };
       },
     },
 
@@ -1062,7 +1114,8 @@ export function buildUnifiedTools(): UnifiedTool[] {
       async execute(args, ctx) {
         const q = buildWinQuery(args);
         const ok = await ctx.platform.setWindowState('normal', q);
-        return { success: ok, text: ok ? 'Restored window.' : 'Restore request failed.' };
+        const note = ctx.platform.takeWindowNote?.();
+        return { success: ok, text: note ?? (ok ? 'Restored window.' : 'Restore request failed.') };
       },
     },
 
@@ -1082,7 +1135,9 @@ export function buildUnifiedTools(): UnifiedTool[] {
       async execute(args, ctx) {
         const q = buildWinQuery(args);
         const ok = await ctx.platform.setWindowState('close', q);
-        return { success: ok, text: ok ? 'Close request posted.' : 'Close request failed.', targetLabel: 'close_window' };
+        // The note names the window and says whether it closed or is still open; or lists the windows that matched.
+        const note = ctx.platform.takeWindowNote?.();
+        return { success: ok, text: note ?? (ok ? 'Close request posted.' : 'Close request failed.'), targetLabel: 'close_window' };
       },
     },
 
@@ -1363,14 +1418,30 @@ export function buildUnifiedTools(): UnifiedTool[] {
     {
       name: 'browser_connect',
       description: 'Open/attach a dedicated browser the agent controls via the DOM (reliable for web pages — no pixels). Call this FIRST for any website task, then use navigate_browser, cdp_page_context, cdp_click, cdp_type. If it fails, fall back to ocr_read_screen/smart_click.',
-      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+      inputSchema: { type: 'object', properties: {
+        port: { type: 'number', description: 'Attach to the browser or app already listening for CDP on this port (e.g. the port relaunch_with_cdp opened). Omit to use the agent browser.' },
+      }, additionalProperties: false },
       changesScreen: true,
-      async execute(_args, ctx) {
+      async execute(args, ctx) {
         if (!ctx.cdp) return { success: false, text: 'cdp_connect: CDP not available in this build — use ocr_read_screen/smart_click for the page instead.' };
         // Same policy as navigate_browser (CLAWD_AGENT_CDP_OFF=1 → attach-only),
         // so both land on the one driver instance.
         const connectOpts = agentBrowserConnectOptions();
-        const ok = await ctx.cdp.ensureConnected(connectOpts).catch(() => false);
+        const port = args.port;
+        if (port !== undefined && (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535)) {
+          return { success: false, isError: true, text: 'cdp_connect: port must be a whole number from 1 to 65535.' };
+        }
+        let ok: boolean;
+        if (port !== undefined) {
+          // A named port is that browser or nothing: never the agent's own browser in its place.
+          if (await ctx.cdp.isConnected().catch(() => false)) await ctx.cdp.disconnect();
+          ok = await ctx.cdp.connect(port).catch(() => false);
+        } else {
+          ok = await ctx.cdp.ensureConnected(connectOpts).catch(() => false);
+        }
+        if (!ok && port !== undefined) {
+          return { success: false, text: `cdp_connect: could not attach to a CDP browser on port ${port}: ${ctx.cdp.getConnectError() || 'no reason given'}. Nothing was launched in its place.` };
+        }
         if (!ok) {
           // Why, and what to do: the driver already waited for an attach-only port (#378).
           const why = ctx.cdp.getConnectError() || 'no reason given';
@@ -1409,7 +1480,12 @@ export function buildUnifiedTools(): UnifiedTool[] {
         if (!ctx.cdp || !(await ctx.cdp.isConnected())) return { success: false, text: 'cdp_page_context: not connected — call cdp_connect first.' };
         const selector = typeof args.selector === 'string' ? args.selector.trim() : '';
         const frame = frameArg(args);
-        const text = selector ? await ctx.cdp.readText(selector, 3000, frame) : await ctx.cdp.getPageContext(frame);
+        let text: string;
+        try {
+          text = selector ? await ctx.cdp.readText(selector, 3000, frame) : await ctx.cdp.getPageContext(frame);
+        } catch (e) {
+          return { success: false, isError: true, text: `cdp_page_context failed: ${e instanceof Error ? e.message : String(e)}` };   // a selector that matches nothing
+        }
         // Page content is the highest-risk injection surface — always delimited.
         return { success: true, text: wrapUntrustedScreenContent(text) };
       },
@@ -1434,7 +1510,7 @@ export function buildUnifiedTools(): UnifiedTool[] {
         if (!text && !selector) return { success: false, isError: true, text: 'cdp_click: provide text or selector.' };
         const frame = frameArg(args);
         const r = text ? await ctx.cdp.clickByText(text, Infinity, frame) : await ctx.cdp.click(selector, frame);
-        return r.success ? { success: true, text: `cdp_click: clicked ${text ? `"${text}"` : selector} (${r.method})${r.frame ? ` in iframe ${quoteScreenText(r.frame)}` : ''}` } : { success: false, text: `cdp_click failed: ${r.error}. Call cdp_page_context to see the actual elements, then retry.` };
+        return r.success ? { success: true, text: `cdp_click: clicked ${text ? `"${text}"` : selector} (${r.method})${r.clicked ? `: hit ${quoteScreenText(r.clicked)}` : ''}${r.frame ? ` in iframe ${quoteScreenText(r.frame)}` : ''}` } : { success: false, text: `cdp_click failed: ${r.error}. Call cdp_page_context to see the actual elements, then retry.` };
       },
     },
     {
@@ -1443,7 +1519,7 @@ export function buildUnifiedTools(): UnifiedTool[] {
       inputSchema: {
         type: 'object',
         properties: {
-          text: { type: 'string', description: 'Text to type.' },
+          text: { type: 'string', description: 'Text to type. A trailing newline is not typed: it presses Enter after the text (e.g. to submit a search).' },
           selector: { type: 'string', description: 'CSS selector for the input.' },
           label: { type: 'string', description: 'Label text associated with the input (alternative to selector).' },
           frame: FRAME_ARG,
@@ -1454,7 +1530,10 @@ export function buildUnifiedTools(): UnifiedTool[] {
       changesScreen: true,
       async execute(args, ctx) {
         if (!ctx.cdp || !(await ctx.cdp.isConnected())) return { success: false, text: 'cdp_type: not connected — call cdp_connect first.' };
-        const text = String(args.text ?? '');
+        // A trailing newline means Enter, as in computer type: fill the field, then press it (never type the newline into the field).
+        const raw = String(args.text ?? '');
+        const enter = /\r?\n$/.test(raw);
+        const text = enter ? raw.replace(/\r?\n$/, '') : raw;
         const selector = typeof args.selector === 'string' ? args.selector.trim() : '';
         const label = typeof args.label === 'string' ? args.label.trim() : '';
         if (!selector && !label) return { success: false, isError: true, text: 'cdp_type: provide selector or label.' };
@@ -1462,7 +1541,14 @@ export function buildUnifiedTools(): UnifiedTool[] {
         const r = label ? await ctx.cdp.typeByLabel(label, text, frame) : await ctx.cdp.typeInField(selector, text, frame);
         if (!r.success) return { success: false, text: `cdp_type failed: ${r.error}` };
         // The fill replaced the field's text: read it back, as every set is (#399).
-        return setVerdict(await readBackTyped(async () => r.read?.() ?? null, text, { whole: true }), text, selector || label, ` (browser)${r.frame ? ` in iframe ${quoteScreenText(r.frame)}` : ''}`);
+        const where = ` (browser)${r.frame ? ` in iframe ${quoteScreenText(r.frame)}` : ''}`;
+        const verdict = setVerdict(await readBackTyped(async () => r.read?.() ?? null, text, { whole: true }), text, selector || label, where);
+        if (!enter) return verdict;
+        // Enter goes after the read-back (it may submit or clear the field), and never over a field that did not take the text.
+        if (!verdict.success) return { ...verdict, text: `${verdict.text} Enter was NOT pressed.` };
+        const key = await ctx.cdp.pressKey('Enter');
+        if (!key.success) return { success: false, text: `${verdict.text} Enter failed: ${key.error}` };
+        return { ...verdict, text: `${verdict.text} Then pressed Enter.` };
       },
     },
   ];
@@ -1659,6 +1745,15 @@ function focusBreadcrumb(before: WindowRead, after: WindowRead): string {
 
 const PATH_MAX_POINTS = 100;
 const PATH_MAX_MS = 30_000;
+/** The button and click count a click was asked for; one the adapters cannot send is refused, not turned into a left single click. */
+function clickHow(args: Record<string, unknown>): { button: 'left' | 'right' | 'middle'; count: 1 | 2 | 3 } | { error: string } {
+  const button = args.button ?? 'left';
+  if (button !== 'left' && button !== 'right' && button !== 'middle') return { error: `click: button must be "left", "right" or "middle", got ${JSON.stringify(args.button)}` };
+  const count = args.count ?? 1;
+  if (count !== 1 && count !== 2 && count !== 3) return { error: `click: count must be 1, 2 or 3, got ${JSON.stringify(args.count)}` };
+  return { button, count };
+}
+
 /**
  * click with `path`: one click per point, in order, `interval_ms` apart. Each mouseClick goes through the input guard, so
  * the user's Stop (and a window change) refuses the next point; the reply then says how many landed first.
@@ -1670,8 +1765,9 @@ async function clickPath(args: Record<string, unknown>, ctx: AgentToolContext) {
     return { success: false, isError: true, text: 'click: `path` must be a non-empty array of {x,y} points with finite coords' };
   }
   const points = pts as Array<{ x: unknown; y: unknown }>;
-  const button = args.button === 'right' ? 'right' : 'left';
-  const count = args.count === 2 ? 2 : 1;
+  const how = clickHow(args);
+  if ('error' in how) return { success: false, isError: true, text: how.error };
+  const { button, count } = how;
   const interval = typeof args.interval_ms === 'number' && args.interval_ms >= 0 ? Math.min(5000, args.interval_ms) : 100;
   // One call must end well inside a client's request timeout, or the client gives up while clicks keep landing.
   if (points.length > PATH_MAX_POINTS || points.length * interval > PATH_MAX_MS) {
@@ -1804,7 +1900,7 @@ function truncateTitle(s: string): string {
  * Returns a loud, actionable suffix telling the agent to verify focus before
  * typing; empty string when the click looks clean.
  */
-export function focusTheftWarning(
+function focusTheftWarning(
   activation: { activated: boolean; title?: string; processName?: string; reason?: string; action?: string } | void,
   before: WindowRead,
   after: WindowRead,

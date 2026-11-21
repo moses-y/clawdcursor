@@ -61,14 +61,11 @@ import './quiet-warnings';   // first: before any dependency can emit DEP0040
 import { Command } from 'commander';
 import { VERSION } from '../version';
 import { authHeaders } from './auth';
-import dotenv from 'dotenv';
 import pc from 'picocolors';
 import { migrateFromLegacyDir } from '../paths';
 import { stopHostApp } from '../platform/native-helper';
-import { stopControl, resumeControl, isStopped } from '../core/control';
+import { stopControl, giveControlBack } from '../core/control';
 import { foreignOverlayState } from '../core/overlay-state';
-
-dotenv.config({ quiet: true });
 
 migrateFromLegacyDir();
 
@@ -277,6 +274,10 @@ program
       console.error(`❌ Failed to request permissions: ${err}`);
       console.error(`   ${nativeBuildHint()}`);
     }
+    // Build the accessibility helper now rather than at the first call. Never fails grant: it is built on first use otherwise.
+    const { prebuildMacAxHelper } = await import('../platform/mac-ax');
+    const helper = await prebuildMacAxHelper();
+    if (helper !== 'unavailable') console.log(`   Accessibility helper: ${helper === 'built' ? 'built' : 'ready'}`);
   });
 
 program
@@ -356,15 +357,15 @@ program
 
 program
   .command('resume')
-  .description('Continue a task the daemon paused for you (same as the on-screen Resume), or --end it; a stdio MCP server\'s pause is answered on its card. After a stop, gives control back.')
+  .description('Continue a task the daemon paused for you (same as the on-screen Resume), or --end it; a stdio MCP server\'s pause is answered on its card. After a stop or a hold (the pill\'s Pause), gives control back.')
   .option('--end', 'End the paused task')
   .option('--port <port>', 'API server port (default: the running daemon\'s port, else 3847)')
   .action(async (opts) => {
     const port = clientPort(opts.port);
     const answer = opts.end ? 'end' : 'resume';
-    const gaveBack = !opts.end && isStopped();
+    // A stop and a hold (the pill's Pause, or a takeover the user kept working through) both end here, whichever is set.
+    const gaveBack = !opts.end && giveControlBack('cli');
     if (gaveBack) {
-      resumeControl('cli');
       console.log(`${e('▶', '>')} control given back: clawdcursor may act again`);
     }
     if (!(await isClawdInstance(port))) {
@@ -539,7 +540,7 @@ function printPostConsentNextSteps(): void {
   console.log('');
   console.log(`  ${pc.bold('Use clawdcursor from your own agent (Claude Code, Codex, Cursor, ...):')}`);
   console.log('');
-  console.log(`       Register ${pc.cyan('clawdcursor mcp')} with Claude Code, Cursor, Windsurf, Zed, etc.`);
+  console.log(`       Register ${pc.cyan('clawdcursor mcp --compact')} with Claude Code, Cursor, Windsurf, Zed, etc.`);
   console.log(`       No daemon, no API key: your editor spawns clawdcursor on demand.`);
   console.log(`       Or start the HTTP MCP server yourself: ${pc.cyan('clawdcursor agent')} (on :3847).`);
   console.log('');

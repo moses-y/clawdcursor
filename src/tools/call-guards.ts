@@ -24,7 +24,15 @@ export interface GuardedCall {
   /** Allowed while a pause waits / while the user has stopped clawdcursor (own-ui-guard.ts). */
   pauseSafe: boolean;
   stopSafe: boolean;
+  /** Sends input or changes a window: another process's pause card holds these, and only these (own-ui-guard.ts). */
+  acts: boolean;
 }
+
+/**
+ * Under another process's pause card these act too, though no outcome line counts them: a pointer move (it moves the user's
+ * cursor), a page script (it can click and type in the page) and a browser connect (it can start a browser).
+ */
+const ALSO_ACTS = new Set(['computer.hover', 'computer.move', 'computer.mouse_move', 'computer.move_relative', 'browser.evaluate', 'browser.connect']);
 
 /**
  * A call as the guards see it. Allowed while paused / stopped by its compact name; never a batch step with a
@@ -35,6 +43,7 @@ export function guardedCall(tool: string, action: string | undefined, args: Reco
   return {
     tool, action, args,
     pauseSafe: !precondition && isPauseSafeCall(c.tool, c.action), stopSafe: !precondition && isStopSafeCall(c.tool, c.action),
+    acts: isActingAction(c.tool, c.action) || ALSO_ACTS.has(`${c.tool}.${c.action}`),
   };
 }
 
@@ -46,7 +55,7 @@ export async function refusalBefore(c: GuardedCall, ctx: ToolContext, passedStop
     const why = await imagePointerRefusal(ctx, c.args);
     if (why) return { guard: 'screen_binding', why };
   }
-  const ownUi = ownUiRefusal(c.args, c.pauseSafe, c.stopSafe);
+  const ownUi = ownUiRefusal(c.args, c.pauseSafe, c.stopSafe, c.acts);
   return ownUi ? { guard: 'own_ui', why: ownUi } : null;
 }
 

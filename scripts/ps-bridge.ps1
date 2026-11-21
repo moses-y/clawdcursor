@@ -366,7 +366,7 @@ function ConvertTo-UINode {
         children     = @()
     }
     # What the app shows on hover (UIA HelpText), when it says more than the name.
-    try { $help = $cur.HelpText; if ($help -and $help -ne $cur.Name) { $node.help = $help } } catch {}
+    try { $help = $cur.HelpText; if ($help -and $help -ne $node.name) { $node.help = $help } } catch {}
     Add-StateFields $node $Element $typeName
 
     if ($Depth -lt $MaxDepth) {
@@ -504,6 +504,28 @@ function Get-ScopeOtherWindows {
         try { $sh = [IntPtr][int]@($scopeWindows)[0].Current.NativeWindowHandle } catch { }
         return [int](Get-OtherWindowCount (Get-PidWindowCandidates $wpid) $sh)
     } catch { return 0 }
+}
+
+# `within` can name another top-level window of the same process, not only a dialog inside the searched one: a browser's
+# "Restore pages?" bubble is a window of its own, and the main window is the one searched. That window, when its title holds
+# `within` and the searched window's does not; nothing otherwise. One pipeline item (the caller's @(...) stays flat).
+function Get-WithinWindow {
+    param([int]$wpid, [string]$within, $scopeWindows)
+    $key = ConvertTo-TitleKey $within
+    if (-not $key) { return }
+    $sh = [IntPtr]::Zero
+    foreach ($w in @($scopeWindows)) {
+        try { if ((ConvertTo-TitleKey $w.Current.Name).Contains($key)) { return } } catch { }
+    }
+    try { $sh = [IntPtr][int]@($scopeWindows)[0].Current.NativeWindowHandle } catch { }
+    $candidates = Get-PidWindowCandidates $wpid   # returned as one array (`return ,$found`): assigned, not wrapped
+    foreach ($c in @($candidates)) {
+        if ($null -eq $c -or $c.Handle -eq $sh) { continue }
+        try {
+            $el = ConvertFrom-ScopeHandle $c.Handle
+            if ($null -ne $el -and (ConvertTo-TitleKey $el.Current.Name).Contains($key)) { return $el }
+        } catch { }
+    }
 }
 
 # A window title as compared: format characters (zero-width space, joiners, BOM, soft hyphen: Edge puts a U+200B inside
@@ -1112,12 +1134,8 @@ function Cmd-FocusWindow {
                 if ($tl -and (ConvertTo-TitleKey $w.Current.Name).Contains($tl)) { $target = $w; break }
             } catch {}
         }
-        # Fall back to pid-only if no title match (caller may have passed a stale title)
-        if ($null -eq $target) {
-            foreach ($w in $allWins) {
-                try { if ($w.Current.ProcessId -eq $wpid) { $target = $w; break } } catch {}
-            }
-        }
+        # No fallback to pid-only: a title that matched nothing is "not found", never another window of the same process
+        # (it would be focused and reported as the match).
     } elseif ($wpid -gt 0) {
         foreach ($w in $allWins) {
             try { if ($w.Current.ProcessId -eq $wpid) { $target = $w; break } } catch {}
@@ -1443,7 +1461,7 @@ function Cmd-FindElement {
                 className=$c.ClassName; processId=$c.ProcessId; isEnabled=$c.IsEnabled; bounds=$bounds
                 value=(Get-ShownValue $el $c $c.ControlType.ProgrammaticName)
             }
-            if ($c.HelpText -and $c.HelpText -ne $c.Name) { $r.help = $c.HelpText }
+            $help = $c.HelpText; if ($help -and $help -ne $r.name) { $r.help = $help }   # one live read, compared with the name already read
             Add-StateFields $r $el $c.ControlType.ProgrammaticName
             if ($onMonitor) { $results += $r } else { $offMonitor += $r }
         } catch {}
@@ -1707,7 +1725,13 @@ function Cmd-InvokeElement {
     $scopeWindows = @(Get-ProcessScopeWindows $wpid)
     if ($scopeWindows.Count -eq 0) { return @{ success=$false; reason="no_window"; error="No window for pid $wpid" } }
 
-    # The one window the agent works in (Get-ProcessScopeWindows), never the pid's other windows.
+    # The one window the agent works in (Get-ProcessScopeWindows), never the pid's other windows: except one that `within`
+    # names by its title, searched after it.
+    $withinWindow = $null
+    if ($within -ne "") {
+        $withinWindow = @(Get-WithinWindow $wpid $within $scopeWindows)[0]
+        if ($null -ne $withinWindow) { $scopeWindows = @($scopeWindows) + @($withinWindow) }
+    }
     $element = $null
     $hiddenOnly = $false
     foreach ($window in $scopeWindows) {
@@ -1753,7 +1777,8 @@ function Cmd-InvokeElement {
             $passOf.Add($(if ($elName.Length -eq 0) { 0 } elseif ($elName -eq $nameLower) { 1 } elseif ($elName -match $prefixRe) { 2 }
                 elseif ($elName.Contains($nameLower)) { 3 } elseif (Test-NameMatch $elName $nameLower) { 4 } else { 0 }))
         }
-        if ($within -ne "") {
+        # Every element of the window `within` names by its title is in it: no container to check.
+        if ($within -ne "" -and -not ($null -ne $withinWindow -and [object]::ReferenceEquals($window, $withinWindow))) {
             # `within` names the window, dialog or document the element is in, as an ambiguous list shows it: its nearest one, so
             # naming the outer window does not also take the dialog inside it.
             for ($k = 0; $k -lt $names.Count; $k++) {

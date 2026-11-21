@@ -16,7 +16,13 @@ import type { ToolContext } from '../tools/types';
 const openFile = getExtraTools().find(t => t.name === 'open_file')!;
 
 const dir = join(tmpdir(), `clawd-of-${process.pid}`);
-beforeAll(async () => { await fs.mkdir(dir, { recursive: true }); });
+const SAM = join(dir, "Sam's $notes.txt");
+const CALC = join(dir, 'calc.exe');   // a real file on every OS: CI runs Linux, where C:/Windows does not exist
+beforeAll(async () => {
+  await fs.mkdir(dir, { recursive: true });
+  // open_file stats the path first: these are the files the tests below open.
+  for (const f of ['report.pdf', "Sam's $notes.txt", 'a.txt', 'nope', 'calc.exe']) await fs.writeFile(join(dir, f), '');
+});
 afterAll(async () => { await fs.rm(dir, { recursive: true, force: true }); });
 
 function ctx(launchApp: any): ToolContext {
@@ -57,28 +63,28 @@ describe('open_file — a file is opened by its own program: no Explorer window 
   // Live: `Opened: C:/Windows/System32/calc.exe (window: "Screenshots - File Explorer")`, and Calculator never started.
   it('a program: launchApp is told Explorer is only the launcher, and which processes are the program', async () => {
     const spy = vi.fn(async () => ({}));
-    await openFile.handler({ path: 'C:/Windows/System32/calc.exe' }, ctx(spy));
+    await openFile.handler({ path: CALC }, ctx(spy));
     expect(spy).toHaveBeenCalledWith('explorer.exe', expect.objectContaining({
-      url: 'C:/Windows/System32/calc.exe', viaLauncher: true, noStartMenuFallback: true,
+      url: CALC, viaLauncher: true, noStartMenuFallback: true,
       processNames: expect.arrayContaining(['calc', 'CalculatorApp']),
     }));
   });
 
   it('a program whose window was not found: says so, and names no window', async () => {
-    const r = await openFile.handler({ path: 'C:/Windows/System32/calc.exe' }, ctx(async () => ({})));
+    const r = await openFile.handler({ path: CALC }, ctx(async () => ({})));
     expect(r.text).toMatch(/neither a window nor a process of calc\.exe was found/);
     expect(r.text).not.toMatch(/\(window:/);
   });
 
   it('a program whose process is up but whose window is not yet: started, with its pid, and how to reach it', async () => {
-    const r = await openFile.handler({ path: 'C:/Windows/System32/calc.exe' }, ctx(async () => ({ pid: 400, processName: 'CalculatorApp' })));
+    const r = await openFile.handler({ path: CALC }, ctx(async () => ({ pid: 400, processName: 'CalculatorApp' })));
     expect(r.isError).toBeFalsy();
     expect(r.text).toMatch(/pid=400\) but its window isn't up yet/);
     expect(r.text).toContain('window {"action":"focus","processName":"CalculatorApp"}');
   });
 
   it('a program whose own window surfaced is reported', async () => {
-    const r = await openFile.handler({ path: 'C:/Windows/System32/calc.exe' }, ctx(async () => ({ title: 'Calculator', pid: 400 })));
+    const r = await openFile.handler({ path: CALC }, ctx(async () => ({ title: 'Calculator', pid: 400 })));
     expect(r.text).toMatch(/Opened: .*calc\.exe \(window: .*Calculator/);
   });
 
@@ -95,23 +101,37 @@ describe('open_file — a refused path says why; macOS and Linux go through the 
     ({ ensureInitialized: async () => {}, platform: { platform, launchApp: vi.fn(launchApp) } } as unknown as ToolContext);
 
   it('Windows: the adapter\'s refusal reaches the agent', async () => {
-    const r = await openFile.handler({ path: 'C:\\x\\a"b.txt' }, ctx(async () => { throw new Error('launchApp: the path or URL to open contains a double quote or a control character'); }));
+    const r = await openFile.handler({ path: join(dir, 'a.txt') }, ctx(async () => { throw new Error('launchApp: the path or URL to open contains a double quote or a control character'); }));
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/double quote or a control character/);
   });
 
   it.each([['darwin', 'open'], ['linux', 'xdg-open']])('%s: hands the path to `%s`, and claims no window', async (platform, opener) => {
     const spy = vi.fn(async () => ({}));
-    const r = await openFile.handler({ path: "/home/x/Sam's $notes.txt" }, tool(platform, spy));
-    expect(spy).toHaveBeenCalledWith(opener, { url: "/home/x/Sam's $notes.txt" });
+    const r = await openFile.handler({ path: SAM }, tool(platform, spy));
+    expect(spy).toHaveBeenCalledWith(opener, { url: SAM });
     expect(r.isError).toBeFalsy();
     expect(r.text).toMatch(/^Opened: .*no window was checked/);
     expect(r.text).not.toMatch(/list_windows/);
   });
 
   it.each([['darwin'], ['linux']])('%s: the opener\'s failure is the result', async (platform) => {
-    const r = await openFile.handler({ path: '/nope' }, tool(platform, async () => { throw new Error('The file /nope does not exist.'); }));
+    const r = await openFile.handler({ path: join(dir, 'nope') }, tool(platform, async () => { throw new Error('The file /nope does not exist.'); }));
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/does not exist/);
+  });
+});
+
+// Audit 2026-11-19 (27): a path that does not exist said "Opened: <path>".
+describe('open_file — a path that is not there fails, on every platform', () => {
+  it.each(['win32', 'darwin', 'linux'])('%s: stats first, and never hands a missing path to the opener', async (platform) => {
+    const launchApp = vi.fn(async () => ({ title: 'x' }));
+    const c = { ensureInitialized: async () => {}, platform: { platform, launchApp } } as unknown as ToolContext;
+    for (const path of [join(dir, 'missing.docx'), join(dir, 'no-such-folder', 'a.txt')]) {
+      const r = await openFile.handler({ path }, c);
+      expect(r.isError).toBe(true);
+      expect(r.text).toBe(`open_file failed: no such file or folder: ${path}`);
+    }
+    expect(launchApp).not.toHaveBeenCalled();
   });
 });

@@ -16,7 +16,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 
   <!--
-    AGENT-READABLE SUMMARY (v2.2.0)
+    AGENT-READABLE SUMMARY (v2.3.0)
     clawdcursor: a local MCP server that gives an AI agent control of the desktop.
 
     ── WHAT IT IS ──────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@
                       the user's own browser is read through the accessibility tree.
       computer      : raw mouse and keyboard; screenshot is the last resort
       batch         : several calls in one round trip, each step guarded
-    89 granular tools (one per action, about 19,000 tokens) without --compact.
+    90 granular tools (one per action, about 19,000 tokens) without --compact.
 
     ── HOW TO USE IT: BLIND FIRST ──────────────────────────────────────────────
     SEE: accessibility read_tree -> system copy_all_text -> system ocr ->
@@ -117,8 +117,9 @@
     user keeps using the computer), an amber glow covers the whole screen when it
     uses the mouse and keyboard, and a blue glow covers the whole screen when it
     needs the user for a step. On Windows and macOS it never types or moves the
-    mouse while the user is using the computer: it waits until the user has been
-    idle 1 s. The pill has Pause and Resume.
+    mouse while the user is using the computer: it keeps working by name in the
+    background, and a step that needs the mouse or keyboard runs once the user has
+    been idle 1 s. The pill has Pause and Resume.
 
     ── PLATFORMS ───────────────────────────────────────────────────────────────
     Windows 10/11 (x64 + ARM64), macOS 12+ (Intel + Apple Silicon),
@@ -476,7 +477,7 @@
 
   <!-- Hero -->
   <div class="hero">
-    <div class="hero-badge"><div class="pulse"></div> v2.2.0 &middot; free and open source &middot; Windows, macOS, Linux</div>
+    <div class="hero-badge"><div class="pulse"></div> v2.3.0 &middot; free and open source &middot; Windows, macOS, Linux</div>
     <h1>Gives any AI control<br><span class="gr">over the GUI.</span></h1>
     <p>The fallback execution layer: when there's no API, CLI or file edit for the job, your AI uses the screen through clawdcursor. It picks the fastest way into each app: the page itself in browsers, the accessibility tree in desktop apps, text recognition when there's no tree, and screenshots last. After every action it tells your AI whether it worked.</p>
     <div class="hero-btns">
@@ -698,7 +699,7 @@
             </tr>
             <tr>
               <td style="padding:12px 16px;vertical-align:top;color:var(--text);font-weight:600;">Compact tools</td>
-              <td style="padding:12px 16px;vertical-align:top;color:var(--text2);">The six tools your AI sees with <code>--compact</code>: accessibility, system, window, browser, computer and batch. Without it there are 89 smaller tools, one per action.</td>
+              <td style="padding:12px 16px;vertical-align:top;color:var(--text2);">The six tools your AI sees with <code>--compact</code>: accessibility, system, window, browser, computer and batch. Without it there are 90 smaller tools, one per action.</td>
             </tr>
         </tbody>
       </table>
@@ -742,7 +743,7 @@
       <div class="feat-card">
         <div class="feat-icon">🟧</div>
         <h4>Three screen states</h4>
-        <p>An amber outline around the agent's window: it works in the background and you keep using the computer. An amber glow on the whole screen: it is using the mouse and keyboard. A blue glow on the whole screen: it needs you for a step.</p>
+        <p>An amber outline around the agent's window: it works in the background and you keep using the computer. An amber glow on the whole screen: it is using the mouse and keyboard. A blue glow on the whole screen: it needs you for a step. The pill says which of the first two it is: "running in background" or "requires foreground".</p>
       </div>
       <div class="feat-card">
         <div class="feat-icon">🟦</div>
@@ -766,7 +767,7 @@
       </div>
     </div>
     <p style="color:var(--text2);font-size:0.88rem;margin-top:18px;line-height:1.65;">
-      <strong style="color:var(--text);">It waits while you use the computer</strong> (Windows, macOS). It never types or moves the mouse while your hands are on it: it waits until you have been idle for 1 s. If you take over mid-action, nothing more is sent; after 5 s it carries on if you are idle, otherwise it waits for Resume on the pill.
+      <strong style="color:var(--text);">It waits while you use the computer</strong> (Windows, macOS). It never types or moves the mouse while your hands are on it: it waits until you have been idle for 1 s. If you take over mid-action, nothing more is sent, and it carries on by itself once you are idle again: no Resume click needed.
     </p>
     <p style="color:var(--text2);font-size:0.88rem;margin-top:12px;line-height:1.65;">
       <strong style="color:var(--text);">No built-in policy engine.</strong> clawdcursor does not decide what your AI may do: your AI and your MCP host's approval prompts do. If your host approves every tool call on its own, nothing asks before your AI sends, deletes or pays, unless you turn on confirm mode (from 2.1,
@@ -869,7 +870,7 @@ claude plugin install clawdcursor@clawdcursor</code></pre>
   }
 }</code></pre>
         <div class="mode-stats">
-          <div><div class="mode-stat-val">6 / 89</div><div class="mode-stat-lbl">Compact / Granular tools</div></div>
+          <div><div class="mode-stat-val">6 / 90</div><div class="mode-stat-lbl">Compact / Granular tools</div></div>
           <div><div class="mode-stat-val">stdio</div><div class="mode-stat-lbl">Transport</div></div>
         </div>
       </div>
@@ -915,8 +916,8 @@ claude plugin install clawdcursor@clawdcursor</code></pre>
     <details class="cli-details">
       <summary class="cli-summary">
         <span class="sect-label" style="margin-bottom:0;">Tools</span>
-        <span class="cli-summary-title">6 compact tools, or 89 granular <span class="cli-summary-chev" aria-hidden="true">›</span></span>
-        <span class="cli-summary-sub">The 6 compact tools are the recommended surface. The 89 granular tools expose one tool per action.</span>
+        <span class="cli-summary-title">6 compact tools, or 90 granular <span class="cli-summary-chev" aria-hidden="true">›</span></span>
+        <span class="cli-summary-sub">The 6 compact tools are the recommended surface. The 90 granular tools expose one tool per action.</span>
       </summary>
 
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:0;margin-top:18px;overflow-x:auto;-webkit-overflow-scrolling:touch;">
@@ -1020,7 +1021,7 @@ clawdcursor uninstall        <span style="color:var(--text3)"># remove all clawd
 </div>
 
 <footer>
-  <p>clawd<strong>cursor</strong> v2.2.0 · localhost only · MIT ·
+  <p>clawd<strong>cursor</strong> v2.3.0 · localhost only · MIT ·
     <a href="https://clawdcursor.com">Home</a> ·
     <a href="https://github.com/AmrDab/clawdcursor">GitHub</a> ·
     <a href="https://github.com/AmrDab/clawdcursor/blob/main/CHANGELOG.md">Changelog</a> ·
